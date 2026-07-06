@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy this file to config.json next to AutoDoc.exe and fill in the fields below. config.json is gitignored on purpose — never commit real API keys.",
+
+  "api_key": "",
+  "whisper_model": "base",
+  "focus_radius_px": 200,
+  "blur_strength": 15,
+  "sessions_dir": "sessions",
+  "output_dir": "output",
+  "max_screenshots_per_session": 100,
+  "max_image_dimension": 1280,
+
+  "_provider_comment": "provider: 'anthropic' uses the Claude API (needs api_key + claude_model below). 'local' uses any OpenAI-compatible local vision server (Ollama, LM Studio, etc.) — narration and blurred screenshots never leave the machine/network. Switching providers requires no code changes.",
+  "provider": "anthropic",
+  "claude_model": "claude-sonnet-5",
+  "local_endpoint": "http://localhost:11434/v1/chat/completions",
+  "local_model": "llava"
+}

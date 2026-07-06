@@ -1,0 +1,24 @@
+# AutoDoc dependencies
+# ─────────────────────────────────────────────────────────────────────
+# IMPORTANT — install torch BEFORE the rest, using the CPU-only wheel.
+# The default pip install pulls in CUDA libraries (~2 GB). Use instead:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# Then install the remainder:
+#
+#   pip install -r requirements.txt
+#
+# ─────────────────────────────────────────────────────────────────────
+
+anthropic>=0.40.0
+mss>=9.0.2
+Pillow>=10.0.0
+pynput>=1.7.7
+pystray>=0.19.5
+sounddevice>=0.4.6
+numpy>=1.24.0
+openai-whisper>=20231117
+
+# Build tooling
+pyinstaller>=6.0.0
