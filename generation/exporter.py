@@ -12,6 +12,11 @@ Creates:
 The same folder works for two workflows:
   • Manual (Claude Desktop) — user uploads INSTRUCTIONS.md + all images to a conversation
   • Automated (Cowork agent) — scheduled task scans exports/, finds processed=false, handles each
+
+zip_export_folder() additionally packs that folder into a single .zip. This is for
+the "coworker records, admin generates" handoff: a non-technical coworker with no API
+key/local model configured can hit Export, then just attach one .zip file to an email
+or Teams message instead of gathering a folder of loose images.
 """
 
 import json
@@ -339,3 +344,24 @@ def _fmt_duration(started: str, stopped: str) -> str:
         return f"{total // 60}m {total % 60:02d}s"
     except (ValueError, TypeError):
         return "Unknown"
+
+
+# ------------------------------------------------------------------ #
+# Zipping (for the "coworker exports, admin generates" handoff)       #
+# ------------------------------------------------------------------ #
+
+def zip_export_folder(export_dir: Path) -> Path:
+    """
+    Pack an export folder (as produced by export_session) into a single
+    .zip sitting alongside it, e.g. exports/My_Workflow_20260406_173051.zip.
+
+    Returns the path to the created zip file.
+    """
+    zip_base = export_dir.parent / export_dir.name
+    zip_path = shutil.make_archive(
+        base_name=str(zip_base),
+        format="zip",
+        root_dir=str(export_dir.parent),
+        base_dir=export_dir.name,
+    )
+    return Path(zip_path)

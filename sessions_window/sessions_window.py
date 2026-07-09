@@ -169,7 +169,7 @@ class SessionsWindow:
         ).pack(side="left", padx=(0, 6))
 
         tk.Button(
-            action_bar, text="Export for Claude", width=16, command=self._export
+            action_bar, text="Export", width=16, command=self._export
         ).pack(side="left", padx=(0, 6))
 
         tk.Button(
@@ -337,29 +337,27 @@ class SessionsWindow:
             messagebox.showerror("AutoDoc", f"Could not read session:\n{exc}")
             return
 
-        from generation.exporter import export_session
+        from generation.exporter import export_session, zip_export_folder
 
         exports_root = get_app_dir() / "exports"
         try:
             export_dir = export_session(session_data, session["session_dir"], exports_root)
+            zip_path = zip_export_folder(export_dir)
         except Exception as exc:
             messagebox.showerror("AutoDoc — Export Failed", f"Export error:\n{exc}")
             return
 
-        self._status_var.set(f"Exported: {export_dir.name}")
+        self._status_var.set(f"Exported: {zip_path.name}")
 
         if messagebox.askyesno(
             "AutoDoc — Exported",
-            f"Session exported to:\n{export_dir}\n\n"
-            f"The folder contains INSTRUCTIONS.md and the blurred screenshots.\n\n"
-            f"To use in Claude Desktop: upload INSTRUCTIONS.md and all images\n"
-            f"from the images/ subfolder into a new conversation.\n\n"
-            f"Open the export folder now?",
+            f"Session exported to:\n{zip_path}\n\n"
+            f"Open the folder containing the zip now?",
         ):
             if sys.platform == "win32":
-                subprocess.Popen(["explorer", str(export_dir)])
+                subprocess.Popen(["explorer", "/select,", str(zip_path)])
             else:
-                subprocess.Popen(["open", str(export_dir)])
+                subprocess.Popen(["open", str(zip_path.parent)])
 
     def _delete(self) -> None:
         session = self._selected_session()

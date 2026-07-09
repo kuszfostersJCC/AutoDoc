@@ -163,7 +163,7 @@ class SessionEditorWindow:
                 right,
                 text=(
                     "This is a transcript-only session.\n\n"
-                    "No screenshots were captured — narration alone will be sent to Claude."
+                    "No screenshots were captured — narration alone will be sent for Documentation."
                 ),
                 fg="#6B7280",
                 font=("TkDefaultFont", 9),
@@ -350,7 +350,7 @@ class SessionEditorWindow:
             frame._delete_btn.configure(text="Restore", fg="#059669")
 
         remaining = len(self._thumb_frames) - len(self._deleted_ids)
-        self._status_var.set(f"{remaining} screenshot(s) will be sent to Claude.")
+        self._status_var.set(f"{remaining} screenshot(s) will be sent for Documentation.")
 
     # ------------------------------------------------------------------ #
     # Save                                                                 #

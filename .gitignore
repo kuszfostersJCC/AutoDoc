@@ -191,3 +191,6 @@ config.json
 
 # Local git history backup bundles created during repo cleanup
 *.bundle
+
+# Runtime diagnostic log (written beside the exe)
+autodoc.log

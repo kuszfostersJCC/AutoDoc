@@ -16,7 +16,10 @@ The Whisper model is pre-loaded in a background thread at startup so there is
 no delay when the user first stops a recording.
 """
 
+import logging
+import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import simpledialog
 from datetime import datetime, timezone
@@ -33,6 +36,8 @@ from transcription.whisper_runner import (
     load_whisper_model,
     transcribe_audio,
 )
+
+log = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -78,7 +83,11 @@ class TrayApp:
     def run(self) -> None:
         """Build the tray icon and block the main thread on pystray's loop."""
         # Kick off Whisper pre-load so it's ready before the first recording ends.
-        threading.Thread(target=self._preload_whisper, daemon=True).start()
+        # Named so it's identifiable in the all-threads stack dump that
+        # _transcribe_and_finalize() logs if this preload never finishes.
+        threading.Thread(
+            target=self._preload_whisper, name="whisper-preload", daemon=True
+        ).start()
 
         self._icon = pystray.Icon(
             "AutoDoc",
@@ -232,7 +241,9 @@ class TrayApp:
 
     def _preload_whisper(self) -> None:
         """Load the Whisper model in the background at startup."""
+        t0 = time.monotonic()
         first_download = not is_model_cached(self.config.whisper_model)
+        log.info("_preload_whisper: model=%r first_download=%s", self.config.whisper_model, first_download)
         if first_download:
             self._notify(
                 f"Downloading speech model (~150 MB) — first-time setup.\n"
@@ -241,20 +252,71 @@ class TrayApp:
         try:
             self._whisper_model = load_whisper_model(self.config.whisper_model)
             self._whisper_ready.set()
+            log.info("_preload_whisper: ready after %.1fs total", time.monotonic() - t0)
             if first_download:
                 self._notify("Speech model downloaded. AutoDoc is ready to use!")
-        except RuntimeError as exc:
+        except Exception as exc:
+            # Broad on purpose. load_whisper_model() wraps its known failure
+            # modes in RuntimeError, but anything it *didn't* anticipate
+            # (OSError from a DLL, MemoryError, ...) used to escape here and
+            # kill this daemon thread with no trace in the log — observed
+            # 2026-07-08 on a target PC: the log simply stopped after the
+            # line above, and the only downstream symptom was the 300s
+            # model-wait timeout. Never let that happen again.
+            log.exception("_preload_whisper: failed after %.1fs", time.monotonic() - t0)
             self._notify(f"Speech model failed to load:\n{exc}")
+
+    @staticmethod
+    def _dump_all_thread_stacks() -> None:
+        """
+        Log the current Python stack of every live thread.
+
+        Called when the model-preload wait times out, to distinguish the two
+        possible causes conclusively from the log alone:
+          - HANG: a thread named 'whisper-preload' appears below, and its
+            stack shows the exact line it's stuck on (e.g. inside
+            `import torch` DLL loading, or whisper's urlopen with no timeout).
+          - DEAD THREAD: no 'whisper-preload' thread appears below — it died.
+            Its traceback will be in the log earlier (via _preload_whisper's
+            except clause or main.py's threading.excepthook).
+        """
+        import traceback
+
+        frames = sys._current_frames()
+        lines = ["_dump_all_thread_stacks: %d live threads" % len(frames)]
+        for thread in threading.enumerate():
+            frame = frames.get(thread.ident)
+            lines.append(
+                "--- thread %r (ident=%s, daemon=%s) ---"
+                % (thread.name, thread.ident, thread.daemon)
+            )
+            if frame is None:
+                lines.append("    <no frame — thread finished>")
+            else:
+                lines.append("".join(traceback.format_stack(frame)).rstrip())
+        log.warning("\n".join(lines))
 
     def _transcribe_and_finalize(self, session: Session) -> None:
         stopped_at = datetime.now(timezone.utc)
         session.stop()
 
         # Wait up to 5 min for the model; it should already be ready in most cases.
+        t0 = time.monotonic()
         if not self._whisper_ready.wait(timeout=300):
+            log.warning(
+                "_transcribe_and_finalize: gave up waiting for the model after %.1fs "
+                "without _preload_whisper ever calling _whisper_ready.set(). Look at the "
+                "_preload_whisper log lines above (or their absence) to see whether "
+                "load_whisper_model() is still hung inside whisper.load_model()/torch.load(), "
+                "or whether it raised and the tray notification just didn't get seen.",
+                time.monotonic() - t0,
+            )
+            self._dump_all_thread_stacks()
             self._notify("Speech model is still loading — please try again shortly.")
             self._apply_state("IDLE")
             return
+        if time.monotonic() - t0 > 1:
+            log.info("_transcribe_and_finalize: waited %.1fs for model to finish preloading", time.monotonic() - t0)
 
         wav_path = session.session_dir / "audio_full.wav"
         try:
@@ -265,6 +327,7 @@ class TrayApp:
             )
             session.add_transcript_segments(segments)
         except Exception as exc:
+            log.exception("_transcribe_and_finalize: transcription failed")
             self._notify(f"Transcription error — session saved without transcript.\nDetail: {exc}")
 
         session.finalize(stopped_at)
@@ -276,8 +339,13 @@ class TrayApp:
     # ------------------------------------------------------------------ #
 
     def _notify(self, message: str) -> None:
+        log.info("_notify: %s", message.replace("\n", " | "))
         if self._icon:
             try:
                 self._icon.notify(message, "AutoDoc")
             except Exception:
-                pass  # Notifications are best-effort; some environments block them.
+                # Windows toast notifications are notoriously unreliable for
+                # unsigned/portable exes and can silently no-op. The log line
+                # above is the one guaranteed place this message actually
+                # shows up.
+                log.exception("_notify: icon.notify() raised (message above may not have been seen)")
