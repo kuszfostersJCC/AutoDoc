@@ -185,10 +185,7 @@ def _prompt_for_api_key() -> str | None:
         "AutoDoc — Setup",
         "Welcome to AutoDoc!\n\n"
         "To generate documentation, an Anthropic API key is required.\n"
-        "Please enter it below. It will be stored in config.json next to\n"
-        "this application and is never transmitted anywhere except to the\n"
-        "Anthropic API when you generate a document.\n\n"
-        "You can skip this — recording and transcription work without it.",
+        "Please enter it below."
     )
 
     key = simpledialog.askstring(
