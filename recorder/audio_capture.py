@@ -25,6 +25,7 @@ class AudioCapture:
         self._wav_file: wave.Wave_write | None = None
         self._lock = threading.Lock()
         self._running = False
+        self._paused = False
 
     def start(self, wav_path: Path) -> None:
         """Open the WAV file and begin streaming microphone audio into it."""
@@ -54,8 +55,22 @@ class AudioCapture:
     ) -> None:
         """PortAudio callback — writes raw PCM bytes directly to the WAV file."""
         with self._lock:
-            if self._running and self._wav_file:
+            if self._running and not self._paused and self._wav_file:
                 self._wav_file.writeframes(indata.tobytes())
+
+    def set_paused(self, paused: bool) -> None:
+        """
+        Pause/resume by DROPPING frames, not closing the stream (PRD F4).
+
+        The microphone stream stays open — PortAudio open/close is slow and
+        occasionally flaky — but paused frames are never written, so the WAV
+        contains no paused span. This is half of the pause-timeline invariant;
+        Session._now_offset_ms() (which subtracts cumulative paused time from
+        event offsets) is the other half. Break one and Whisper timestamps no
+        longer line up with screenshot offsets.
+        """
+        with self._lock:
+            self._paused = paused
 
     def stop(self) -> None:
         """Stop the stream and flush + close the WAV file."""

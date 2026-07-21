@@ -4,33 +4,71 @@ sessions_window/session_editor.py — Session review and editing window.
 A split-pane tkinter window that lets users:
   - Edit the transcript as plain text (left panel)
   - Preview and selectively delete screenshots (right panel)
+  - Choose how screenshots are rendered — raw / blurred / circled — with a
+    live re-render of the thumbnails (right panel header)
+  - Add externally-sourced photos to the session (e.g. a phone photo of a
+    BIOS screen AutoDoc physically cannot screenshot) via recorder/
+    session.py::import_screenshots()
   - Save changes back to session.json
   - Kick off documentation generation directly
+
+Screenshot panel visibility (changed 2026-07-20):
+  The panel is now ALWAYS the full thumbnail view, never a static "no
+  screenshots" notice keyed off session_type == "transcript_only". A
+  session's session_type only ever controlled whether recorder/session.py
+  auto-captured clicks — it was never a hard guarantee of zero screenshots,
+  and now that photos can be imported after the fact, that guarantee would
+  be actively wrong. Any UI/export logic that needs to know "does this
+  session have screenshots" checks the actual event list (screenshot_count),
+  not the mode label. See HANDOFF.md for the full rationale.
 
 Transcript storage:
   The edited text is stored as "edited_full_transcript" in session.json.
   When this key is present, the generation backend uses it in place of the
   individual Whisper segments.
 
+Screenshot rendering:
+  Screenshots are stored RAW on disk (see recorder/screenshot.py). The mode
+  chosen here is stored as "screenshot_render_mode" in session.json and is
+  applied at preview/export/generation time — switching it is always
+  reversible. Legacy sessions (pre-raw-storage) have destructively blurred
+  PNGs and no click coordinates, so the selector is disabled for them.
+
 Screenshot deletion:
   Clicking the Delete button on a thumbnail marks that event_id for removal.
   On Save, those events are stripped from session.json. The PNG files are also
   deleted from disk so they don't consume space or tokens.
+
+THREADING MODEL (do not regress — see ui_service.py):
+open_editor_window() must be called ON the ui_service UI thread. The window
+is a Toplevel of the shared hidden root — never its own Tk() root in its own
+thread. Worker threads report back via ui_service.call_soon only.
 """
 
 import json
+import logging
 import threading
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Optional
 
 from PIL import Image, ImageTk
 
+import ui_service
+from recorder.screenshot import (
+    RENDER_MODES,
+    event_is_legacy,
+    render_event_image,
+    resolve_render_mode,
+)
+
+log = logging.getLogger(__name__)
+
 
 # ------------------------------------------------------------------ #
-# Entry point                                                          #
+# Entry point (must be called on the ui_service UI thread)             #
 # ------------------------------------------------------------------ #
 
 def open_editor_window(
@@ -40,7 +78,7 @@ def open_editor_window(
     on_generate: Optional[Callable[[dict, Path], None]] = None,
 ) -> None:
     """
-    Open the editor in a new Tk root (called from a daemon thread).
+    Open the editor as a Toplevel of the shared UI root.
 
     Args:
         session_data:  Parsed session.json dict.
@@ -49,13 +87,12 @@ def open_editor_window(
         on_generate:   Optional callback(session_data, session_dir) invoked
                        when the user clicks Generate from within the editor.
     """
-    root = tk.Tk()
+    root = tk.Toplevel(ui_service.get_root())
     name = session_data.get("name") or session_data.get("session_id", "Session")
     root.title(f"AutoDoc — Edit: {name}")
-    root.geometry("1000x620")
-    root.minsize(700, 450)
+    root.geometry(ui_service.scaled_geometry(1000, 620))
+    root.minsize(ui_service.scale(700), ui_service.scale(450))
     SessionEditorWindow(root, session_data, session_dir, config, on_generate)
-    root.mainloop()
 
 
 # ------------------------------------------------------------------ #
@@ -69,7 +106,7 @@ class SessionEditorWindow:
 
     def __init__(
         self,
-        root: tk.Tk,
+        root: tk.Toplevel,
         session_data: dict,
         session_dir: Path,
         config,
@@ -84,6 +121,15 @@ class SessionEditorWindow:
         self._deleted_ids: set[str] = set()
         self._thumb_refs: list = []   # keeps PhotoImage objects alive
         self._thumb_frames: dict[str, tk.Frame] = {}   # event_id → frame
+
+        self._screenshot_events = sorted(
+            [e for e in self.session_data.get("events", []) if e.get("type") == "screenshot"],
+            key=lambda e: e["timestamp_offset_ms"],
+        )
+        self._all_legacy = bool(self._screenshot_events) and all(
+            event_is_legacy(e) for e in self._screenshot_events
+        )
+        self._render_mode = resolve_render_mode(self.session_data, config)
 
         self._build_ui()
         self._populate()
@@ -152,61 +198,70 @@ class SessionEditorWindow:
         self.transcript_box.pack(side="left", fill="both", expand=True)
         t_scroll.pack(side="right", fill="y")
 
-        # Right: screenshot thumbnails — or a plain notice for transcript-only sessions
+        # Right: screenshot thumbnails. Always built the same way regardless
+        # of session_type — a transcript-only recording simply starts with
+        # zero screenshot events (empty grid, handled below), same as any
+        # full-mode session someone deleted every screenshot from. Photos can
+        # be added to either via the Add Screenshot button.
         right = tk.Frame(pane, padx=8, pady=6)
-        is_transcript_only = self.session_data.get("session_type") == "transcript_only"
+        pane.add(right, minsize=260, width=500)
 
-        if is_transcript_only:
-            pane.add(right, minsize=200, width=300)
-            tk.Label(right, text="Screenshots", font=("TkDefaultFont", 10, "bold"), anchor="w").pack(fill="x")
-            tk.Label(
-                right,
-                text=(
-                    "This is a transcript-only session.\n\n"
-                    "No screenshots were captured — narration alone will be sent for Documentation."
-                ),
-                fg="#6B7280",
-                font=("TkDefaultFont", 9),
-                anchor="nw",
-                justify="left",
-                wraplength=260,
-            ).pack(fill="x", pady=(8, 0))
-            # Stubs so the rest of the class doesn't need special-casing
-            self._canvas = tk.Canvas(right)
-            self._thumb_container = tk.Frame(self._canvas)
-            self._canvas_window = None
-        else:
-            pane.add(right, minsize=260, width=500)
-            tk.Label(right, text="Screenshots", font=("TkDefaultFont", 10, "bold"), anchor="w").pack(fill="x")
-            tk.Label(
-                right,
-                text="Click Delete to remove a screenshot. Tip: remove the last few stop-click frames.",
-                fg="#6B7280",
-                font=("TkDefaultFont", 8),
-                anchor="w",
-                wraplength=360,
-            ).pack(fill="x", pady=(0, 4))
+        head_row = tk.Frame(right)
+        head_row.pack(fill="x")
+        tk.Label(head_row, text="Screenshots", font=("TkDefaultFont", 10, "bold"), anchor="w").pack(side="left")
 
-            canvas_frame = tk.Frame(right)
-            canvas_frame.pack(fill="both", expand=True)
+        tk.Button(
+            head_row, text="Add Screenshot…", font=("TkDefaultFont", 8), command=self._import_screenshots
+        ).pack(side="right", padx=(4, 0))
 
-            self._canvas = tk.Canvas(canvas_frame, highlightthickness=0)
-            v_scroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._canvas.yview)
-            self._canvas.configure(yscrollcommand=v_scroll.set)
+        # Render-mode selector: raw / blurred / circled, re-rendered live.
+        tk.Label(head_row, text="Display:", fg="#6B7280", font=("TkDefaultFont", 8)).pack(
+            side="right", padx=(8, 2)
+        )
+        self._mode_var = tk.StringVar(value=self._render_mode)
+        self._mode_combo = ttk.Combobox(
+            head_row,
+            textvariable=self._mode_var,
+            values=list(RENDER_MODES),
+            state="readonly",
+            width=9,
+        )
+        self._mode_combo.pack(side="right")
+        self._mode_combo.bind("<<ComboboxSelected>>", self._on_mode_changed)
 
-            self._canvas.pack(side="left", fill="both", expand=True)
-            v_scroll.pack(side="right", fill="y")
+        self._hint_var = tk.StringVar(value=self._compute_hint())
+        if self._all_legacy:
+            self._mode_combo.configure(state="disabled")
+        tk.Label(
+            right,
+            textvariable=self._hint_var,
+            fg="#6B7280",
+            font=("TkDefaultFont", 8),
+            anchor="w",
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", pady=(0, 4))
 
-            self._thumb_container = tk.Frame(self._canvas)
-            self._canvas_window = self._canvas.create_window(
-                (0, 0), window=self._thumb_container, anchor="nw"
-            )
-            self._thumb_container.bind(
-                "<Configure>",
-                lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")),
-            )
-            self._canvas.bind("<Configure>", self._on_canvas_resize)
-            self._canvas.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        canvas_frame = tk.Frame(right)
+        canvas_frame.pack(fill="both", expand=True)
+
+        self._canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=v_scroll.set)
+
+        self._canvas.pack(side="left", fill="both", expand=True)
+        v_scroll.pack(side="right", fill="y")
+
+        self._thumb_container = tk.Frame(self._canvas)
+        self._canvas_window = self._canvas.create_window(
+            (0, 0), window=self._thumb_container, anchor="nw"
+        )
+        self._thumb_container.bind(
+            "<Configure>",
+            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")),
+        )
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+        self._canvas.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
 
         # ── Footer / action bar ──────────────────────────────────── #
         ttk.Separator(self.root, orient="horizontal").pack(fill="x")
@@ -239,6 +294,115 @@ class SessionEditorWindow:
         self._canvas.itemconfig(self._canvas_window, width=event.width)
 
     # ------------------------------------------------------------------ #
+    # Render mode                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _compute_hint(self) -> str:
+        """Hint text under the Screenshots header — depends on actual
+        screenshot state, never on session_type (see module docstring)."""
+        if not self._screenshot_events:
+            return (
+                "No screenshots yet — narration alone will be sent for Documentation. "
+                "Use “Add Screenshot…” to attach photos taken outside the app "
+                "(e.g. BIOS setup steps AutoDoc can't screenshot directly)."
+            )
+        if self._all_legacy:
+            return (
+                "This session predates editable screenshot effects — its images "
+                "were blurred permanently at capture, so the display mode cannot be changed."
+            )
+        return "Click Delete to remove a screenshot. Tip: remove the last few stop-click frames."
+
+    def _on_mode_changed(self, _event=None) -> None:
+        mode = self._mode_var.get()
+        if mode == self._render_mode:
+            return
+        self._render_mode = mode
+        self.session_data["screenshot_render_mode"] = mode
+        self._rebuild_thumbnails()
+        self._status_var.set(
+            f"Display mode set to '{mode}' — click Save Changes to make it stick "
+            f"for export and generation."
+        )
+
+    def _rebuild_thumbnails(self) -> None:
+        """Destroy and re-create all thumbnails with the current render mode,
+        preserving pending delete marks."""
+        pending_deletes = set(self._deleted_ids)
+        for frame in self._thumb_frames.values():
+            frame.destroy()
+        self._thumb_frames.clear()
+        self._thumb_refs.clear()
+        self._deleted_ids.clear()
+
+        for evt in self._screenshot_events:
+            if any(e["event_id"] == evt["event_id"] for e in self.session_data.get("events", [])):
+                self._add_thumbnail(evt)
+
+        # Re-apply delete marks to frames that still exist.
+        for eid in pending_deletes:
+            frame = self._thumb_frames.get(eid)
+            if frame is not None:
+                self._toggle_delete(eid, frame)
+
+        self._hint_var.set(self._compute_hint())
+        # _all_legacy can flip (e.g. importing legacy-style photos into a
+        # session that previously had only real, non-legacy clicks), so
+        # recompute the combo's enabled state every rebuild, not just at
+        # construction time.
+        self._mode_combo.configure(state="disabled" if self._all_legacy else "readonly")
+
+    # ------------------------------------------------------------------ #
+    # Add Screenshot (append externally-sourced photos)                    #
+    # ------------------------------------------------------------------ #
+
+    def _import_screenshots(self) -> None:
+        """
+        Let the user attach photos taken outside AutoDoc (a phone photo of a
+        BIOS screen, for instance) to this session. Delegates the actual
+        file-copy + event construction to recorder/session.py::
+        import_screenshots() so the event schema lives in exactly one place.
+
+        Files are copied to disk immediately on selection (consistent with
+        how a live recording writes screenshots as they happen), but only
+        become part of session.json when Save Changes is clicked — closing
+        the editor without saving leaves the copies on disk but untracked,
+        same tradeoff as every other unsaved edit in this window.
+        """
+        paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Add Screenshots",
+            filetypes=[
+                ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+
+        from recorder.session import import_screenshots
+
+        try:
+            self.session_data = import_screenshots(
+                self.session_dir, self.session_data, [Path(p) for p in paths]
+            )
+        except OSError as exc:
+            messagebox.showerror("AutoDoc", f"Could not import screenshot(s):\n{exc}", parent=self.root)
+            return
+
+        self._screenshot_events = sorted(
+            [e for e in self.session_data.get("events", []) if e.get("type") == "screenshot"],
+            key=lambda e: e["timestamp_offset_ms"],
+        )
+        self._all_legacy = bool(self._screenshot_events) and all(
+            event_is_legacy(e) for e in self._screenshot_events
+        )
+        self._rebuild_thumbnails()
+        self._status_var.set(
+            f"Added {len(paths)} screenshot(s) — click Save Changes to keep them."
+        )
+
+    # ------------------------------------------------------------------ #
     # Data population                                                      #
     # ------------------------------------------------------------------ #
 
@@ -261,32 +425,34 @@ class SessionEditorWindow:
         self.transcript_box.insert("1.0", transcript_text)
 
         # ── Screenshots ────────────────────────────────────────── #
-        screenshots = sorted(
-            [e for e in events if e.get("type") == "screenshot"],
-            key=lambda e: e["timestamp_offset_ms"],
-        )
-        for evt in screenshots:
+        for evt in self._screenshot_events:
             self._add_thumbnail(evt)
 
-        count = len(screenshots)
+        count = len(self._screenshot_events)
         self._status_var.set(f"{count} screenshot{'s' if count != 1 else ''} • Edit transcript then save or generate.")
 
+    def _load_rendered(self, event: dict) -> Optional[Image.Image]:
+        """Load an event's screenshot with the current render mode applied."""
+        try:
+            return render_event_image(self.session_dir, event, self._render_mode, self.config)
+        except Exception:
+            log.exception("editor: failed to render %s", event["data"].get("filename"))
+            return None
+
     def _add_thumbnail(self, event: dict) -> None:
-        img_path = self.session_dir / event["data"]["filename"]
-        if not img_path.exists():
+        img = self._load_rendered(event)
+        if img is None:
             return
 
-        # Load + resize image for display.
-        # master=self.root is critical when multiple Tk() instances exist —
-        # without it, PIL binds the PhotoImage to the first Tk interpreter
-        # (the Sessions window), and the editor's Tcl interpreter rejects it.
-        try:
-            img = Image.open(img_path)
-            img.thumbnail((self.THUMB_W, self.THUMB_H), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(img, master=self.root)
-            self._thumb_refs.append(photo)
-        except Exception:
-            return
+        img.thumbnail(
+            (ui_service.scale(self.THUMB_W), ui_service.scale(self.THUMB_H)),
+            Image.LANCZOS,
+        )
+        # master= keeps the PhotoImage bound to this window's interpreter.
+        # With the single shared root there is only one interpreter anyway,
+        # but being explicit costs nothing.
+        photo = ImageTk.PhotoImage(img, master=self.root)
+        self._thumb_refs.append(photo)
 
         # Place in a grid: THUMBS_PER_ROW columns
         idx = len(self._thumb_frames)
@@ -305,14 +471,15 @@ class SessionEditorWindow:
         # cursor="hand2" signals the image is clickable (expand on click).
         img_label = tk.Label(cell, image=photo, bg="white", cursor="hand2")
         img_label.pack()
-        img_label.bind("<Button-1>", lambda e, p=img_path: self._show_full_image(p))
+        img_label.bind("<Button-1>", lambda e, evt=event: self._show_full_image(evt))
 
         # Timestamp + click type label
         offset_s = event["timestamp_offset_ms"] / 1000
         click = event["data"].get("click_type", "left")
+        click_label = {"manual": "manual capture", "imported": "imported"}.get(click, f"{click}-click")
         tk.Label(
             cell,
-            text=f"{offset_s:.1f}s  •  {click}-click  •  click to expand",
+            text=f"{offset_s:.1f}s  •  {click_label}  •  click to expand",
             font=("TkDefaultFont", 7),
             fg="#6B7280",
             bg="white",
@@ -331,7 +498,6 @@ class SessionEditorWindow:
         # Store refs so toggle_delete and save can update them.
         cell._delete_btn = delete_btn
         cell._img_label = img_label
-        cell._img_path = img_path
 
         self._thumb_frames[eid] = cell
 
@@ -361,6 +527,7 @@ class SessionEditorWindow:
         Persist edits to session.json. Returns True on success.
         - Removes deleted screenshot events (and their PNG files).
         - Stores the edited transcript as edited_full_transcript.
+        - Stores the chosen screenshot render mode.
         """
         edited_text = self.transcript_box.get("1.0", "end").strip()
         events = self.session_data.get("events", [])
@@ -380,6 +547,11 @@ class SessionEditorWindow:
 
         self.session_data["events"] = kept_events
         self.session_data["edited_full_transcript"] = edited_text
+        if not self._all_legacy:
+            self.session_data["screenshot_render_mode"] = self._render_mode
+        self._screenshot_events = [
+            e for e in self._screenshot_events if e["event_id"] not in self._deleted_ids
+        ]
 
         # Remove deleted thumbnail frames from the UI immediately.
         for eid in list(self._deleted_ids):
@@ -398,7 +570,7 @@ class SessionEditorWindow:
                 json.dump(self.session_data, f, indent=2, ensure_ascii=False)
             tmp.replace(json_path)
         except OSError as exc:
-            messagebox.showerror("AutoDoc", f"Could not save session:\n{exc}")
+            messagebox.showerror("AutoDoc", f"Could not save session:\n{exc}", parent=self.root)
             return False
 
         remaining = len(self._thumb_frames)
@@ -420,32 +592,126 @@ class SessionEditorWindow:
     # Full-size image preview                                              #
     # ------------------------------------------------------------------ #
 
-    def _show_full_image(self, img_path: Path) -> None:
-        """Open a Toplevel popup showing the screenshot at a readable size."""
-        try:
-            img = Image.open(img_path)
-        except Exception as exc:
-            messagebox.showerror("AutoDoc", f"Could not open image:\n{exc}", parent=self.root)
+    def _show_full_image(self, event: dict) -> None:
+        """
+        Full-size preview + redaction editor (PRD F3).
+
+        Drag on the image to draw a privacy pixelation box. Regions are stored
+        in image-space pixels on the event (data.redact_regions) and applied
+        by the render pipeline in every mode — the raw PNG is never modified.
+        Region edits mutate the shared event dict immediately (the same dict
+        object lives in session_data["events"]), so the existing Save Changes
+        button persists them to session.json.
+        """
+        img = self._load_rendered(event)
+        if img is None:
+            messagebox.showerror("AutoDoc", "Could not open image.", parent=self.root)
             return
 
-        # Scale to fit within 1200×800 without upscaling.
-        max_w, max_h = 1200, 800
+        # Scale to fit within 1200×760 (at 96 DPI) without upscaling. ratio
+        # maps image-space → display-space; divide to go back.
+        max_w, max_h = ui_service.scale(1200), ui_service.scale(760)
         ratio = min(max_w / img.width, max_h / img.height, 1.0)
-        if ratio < 1.0:
-            img = img.resize(
-                (int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS
-            )
+        disp_size = (int(img.width * ratio), int(img.height * ratio))
 
         popup = tk.Toplevel(self.root)
-        popup.title(f"Screenshot — {img_path.name}")
-        popup.resizable(True, True)
+        popup.title(f"Screenshot — {event['data'].get('filename', '')} ({self._render_mode})")
+        popup.resizable(False, False)
 
-        # PhotoImage must be bound to the popup's interpreter context.
-        photo = ImageTk.PhotoImage(img, master=popup)
-        popup._photo = photo   # Prevent garbage collection.
+        tk.Label(
+            popup,
+            text="Drag on the image to pixelate sensitive areas (student data, IDs, emails). "
+                 "Changes apply to previews, exports, and generated documents.",
+            fg="#6B7280",
+            font=("TkDefaultFont", 8),
+            wraplength=disp_size[0],
+            justify="left",
+        ).pack(padx=8, pady=(8, 2), anchor="w")
 
-        tk.Label(popup, image=photo).pack()
-        tk.Button(popup, text="Close", command=popup.destroy, padx=12, pady=4).pack(pady=6)
+        canvas = tk.Canvas(
+            popup, width=disp_size[0], height=disp_size[1], highlightthickness=0, cursor="crosshair"
+        )
+        canvas.pack(padx=8, pady=2)
+
+        state = {"start": None, "temp_rect": None, "dirty": False}
+
+        def _redraw() -> None:
+            fresh = self._load_rendered(event)
+            if fresh is None:
+                return
+            disp = fresh.resize(disp_size, Image.LANCZOS)
+            photo = ImageTk.PhotoImage(disp, master=popup)
+            popup._photo = photo  # Prevent garbage collection.
+            canvas.delete("all")
+            canvas.create_image(0, 0, image=photo, anchor="nw")
+
+        def _on_press(evt_tk) -> None:
+            state["start"] = (evt_tk.x, evt_tk.y)
+
+        def _on_drag(evt_tk) -> None:
+            if state["start"] is None:
+                return
+            if state["temp_rect"] is not None:
+                canvas.delete(state["temp_rect"])
+            x0, y0 = state["start"]
+            state["temp_rect"] = canvas.create_rectangle(
+                x0, y0, evt_tk.x, evt_tk.y, outline="#DC2626", width=2
+            )
+
+        def _on_release(evt_tk) -> None:
+            if state["start"] is None:
+                return
+            x0, y0 = state["start"]
+            state["start"] = None
+            if state["temp_rect"] is not None:
+                canvas.delete(state["temp_rect"])
+                state["temp_rect"] = None
+            # Normalize, convert display → image space, ignore tiny boxes.
+            left, top = min(x0, evt_tk.x), min(y0, evt_tk.y)
+            w, h = abs(evt_tk.x - x0), abs(evt_tk.y - y0)
+            if w < 5 or h < 5:
+                return
+            region = [
+                int(left / ratio), int(top / ratio),
+                int(w / ratio), int(h / ratio),
+            ]
+            event["data"].setdefault("redact_regions", []).append(region)
+            state["dirty"] = True
+            _redraw()
+
+        canvas.bind("<ButtonPress-1>", _on_press)
+        canvas.bind("<B1-Motion>", _on_drag)
+        canvas.bind("<ButtonRelease-1>", _on_release)
+
+        def _undo_last() -> None:
+            regions = event["data"].get("redact_regions") or []
+            if regions:
+                regions.pop()
+                state["dirty"] = True
+                _redraw()
+
+        def _clear_all() -> None:
+            if event["data"].get("redact_regions"):
+                event["data"]["redact_regions"] = []
+                state["dirty"] = True
+                _redraw()
+
+        def _done() -> None:
+            popup.destroy()
+            if state["dirty"]:
+                self._rebuild_thumbnails()
+                self._status_var.set(
+                    "Redaction regions changed — click Save Changes to keep them."
+                )
+
+        btn_row = tk.Frame(popup)
+        btn_row.pack(pady=(4, 8))
+        tk.Button(btn_row, text="Undo Last Box", command=_undo_last, padx=10).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Clear All Boxes", command=_clear_all, fg="#DC2626", padx=10).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Done", command=_done, padx=16).pack(side="left", padx=4)
+        popup.protocol("WM_DELETE_WINDOW", _done)
+
+        _redraw()
         popup.focus_set()
 
     # ------------------------------------------------------------------ #
@@ -465,13 +731,15 @@ class SessionEditorWindow:
             self._run_generation_inline()
 
     def _run_generation_inline(self) -> None:
-        self.root.config(cursor="wait")
-        self._status_var.set("Generating documentation…")
+        self._status_var.set(
+            "Generating documentation in the background — the editor stays usable."
+        )
 
         def _work():
+            """Worker thread. Reports back via ui_service.call_soon ONLY."""
             try:
                 from generation.generator import generate_documentation
-                from generation.output_writer import write_output
+                from generation.renderers import write_outputs
                 from config import get_app_dir
 
                 markdown = generate_documentation(
@@ -479,22 +747,28 @@ class SessionEditorWindow:
                     session_data=self.session_data,
                     session_dir=self.session_dir,
                 )
-                output_path = write_output(
+                paths = write_outputs(
                     markdown=markdown,
-                    session_id=self.session_data.get("session_id", "session"),
+                    session_data=self.session_data,
+                    session_dir=self.session_dir,
+                    config=self.config,
                     output_dir=get_app_dir() / self.config.output_dir,
                 )
-                self.root.after(0, lambda: self._on_done(output_path))
+                ui_service.call_soon(lambda: self._on_done(paths[0]))
             except Exception as exc:
+                log.exception("editor: inline generation failed")
                 msg = str(exc)
-                self.root.after(0, lambda: self._on_error(msg))
+                ui_service.call_soon(lambda: self._on_error(msg))
 
-        threading.Thread(target=_work, daemon=True).start()
+        threading.Thread(target=_work, name="doc-generate-editor", daemon=True).start()
 
     def _on_done(self, output_path: Path) -> None:
-        self.root.config(cursor="")
         self._status_var.set(f"Saved: {output_path.name}")
-        if messagebox.askyesno("AutoDoc — Done", f"Documentation saved to:\n{output_path}\n\nOpen now?"):
+        if messagebox.askyesno(
+            "AutoDoc — Done",
+            f"Documentation saved to:\n{output_path}\n\nOpen now?",
+            parent=self.root,
+        ):
             import subprocess, sys
             if sys.platform == "win32":
                 subprocess.Popen(["explorer", "/select,", str(output_path)])
@@ -502,6 +776,9 @@ class SessionEditorWindow:
                 subprocess.Popen(["open", str(output_path)])
 
     def _on_error(self, error: str) -> None:
-        self.root.config(cursor="")
         self._status_var.set("Generation failed.")
-        messagebox.showerror("AutoDoc — Error", f"Could not generate documentation:\n\n{error}")
+        messagebox.showerror(
+            "AutoDoc — Error",
+            f"Could not generate documentation:\n\n{error}",
+            parent=self.root,
+        )
