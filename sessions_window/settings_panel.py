@@ -20,11 +20,13 @@ Runs on the ui_service UI thread like everything else in this window.
 import logging
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
+from typing import Callable, Optional
 
 import ui_service
 from config import AutoDocConfig, write_config
 from recorder.screenshot import RENDER_MODES
+from version import VERSION
 
 log = logging.getLogger(__name__)
 
@@ -35,10 +37,19 @@ _PROVIDERS = ("anthropic", "local")
 
 
 class SettingsPanel(tk.Frame):
-    def __init__(self, parent: tk.Widget, config: AutoDocConfig) -> None:
+    def __init__(
+        self,
+        parent: tk.Widget,
+        config: AutoDocConfig,
+        is_idle: Optional[Callable[[], bool]] = None,
+        quit_for_update: Optional[Callable[[], None]] = None,
+    ) -> None:
         super().__init__(parent)
         self.config_obj = config
+        self._is_idle = is_idle
+        self._quit_for_update = quit_for_update
         self._dirty = False
+        self._pending_update = None  # updater.UpdateInfo once a check finds one
         self._build_scroll_container()
         self._build()
         self._track_changes()
@@ -197,6 +208,23 @@ class SettingsPanel(tk.Frame):
         self._grid_row(ai, 3, "Speech model:", whisper_combo,
                        "Whisper size — bigger is more accurate but slower. Takes effect after restarting AutoDoc.")
 
+        # ── Updates ──────────────────────────────────────────────── #
+        upd = tk.LabelFrame(self._content, text="Updates", padx=10, pady=8)
+        upd.pack(fill="x", pady=(0, 10))
+
+        tk.Label(upd, text=f"Current version: {VERSION}", anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, 4)
+        )
+        self._update_btn = tk.Button(
+            upd, text="Check for Updates", command=self._check_for_updates
+        )
+        self._update_btn.grid(row=1, column=0, sticky="w")
+        self._update_status_var = tk.StringVar(value="")
+        tk.Label(
+            upd, textvariable=self._update_status_var, fg="#6B7280",
+            font=("TkDefaultFont", 8), anchor="w", wraplength=520, justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
         # ── Save row ─────────────────────────────────────────────── #
         save_row = tk.Frame(self._content)
         save_row.pack(fill="x", pady=(4, 0))
@@ -332,3 +360,118 @@ class SettingsPanel(tk.Frame):
         # writes, and none happen here — safe to overwrite the dirty text).
         self._status_var.set(msg)
         log.info("settings saved via Settings tab")
+
+    # ------------------------------------------------------------------ #
+    # Updates — manual only, via GitHub Releases (see updater.py)          #
+    # ------------------------------------------------------------------ #
+
+    def _check_for_updates(self) -> None:
+        self._update_btn.config(state="disabled", text="Checking…")
+        self._update_status_var.set("Checking GitHub for a newer release…")
+
+        def _work() -> None:
+            import updater
+
+            try:
+                info = updater.check_for_update()
+                ui_service.call_soon(lambda: self._on_check_result(info))
+            except updater.UpdateCheckError as exc:
+                msg = str(exc)
+                ui_service.call_soon(lambda: self._on_check_error(msg))
+
+        threading.Thread(target=_work, name="update-check", daemon=True).start()
+
+    def _on_check_result(self, info) -> None:
+        self._update_btn.config(state="normal", text="Check for Updates")
+        if info is None:
+            self._update_status_var.set(f"You're on the latest version ({VERSION}).")
+            return
+        self._pending_update = info
+        self._update_status_var.set(
+            f"Version {info.version} is available (current: {VERSION})."
+        )
+        self._show_update_dialog(info)
+
+    def _on_check_error(self, error: str) -> None:
+        self._update_btn.config(state="normal", text="Check for Updates")
+        self._update_status_var.set(error)
+
+    def _show_update_dialog(self, info) -> None:
+        """
+        Release-notes dialog with Update Now / Not Now — this is the whole
+        "let people decide if they need the new features" requirement: the
+        release body IS the changelog shown here, nothing separate to write.
+        """
+        parent = self.winfo_toplevel()
+        dialog = tk.Toplevel(parent)
+        dialog.title("AutoDoc — Update Available")
+        dialog.transient(parent)
+        dialog.geometry(ui_service.scaled_geometry(480, 360))
+        dialog.grab_set()
+
+        size_mb = info.asset_size / (1024 * 1024) if info.asset_size else 0
+        header = f"Version {info.version} is available (you have {VERSION})."
+        if size_mb:
+            header += f" ~{size_mb:.0f} MB download."
+        tk.Label(dialog, text=header, anchor="w", justify="left", wraplength=440,
+                 font=("TkDefaultFont", 9, "bold")).pack(fill="x", padx=12, pady=(12, 6))
+
+        notes_frame = tk.Frame(dialog)
+        notes_frame.pack(fill="both", expand=True, padx=12)
+        notes_text = tk.Text(notes_frame, wrap="word", height=10, relief="solid", borderwidth=1)
+        notes_scroll = ttk.Scrollbar(notes_frame, orient="vertical", command=notes_text.yview)
+        notes_text.configure(yscrollcommand=notes_scroll.set)
+        notes_text.insert("1.0", info.notes)
+        notes_text.configure(state="disabled")
+        notes_text.pack(side="left", fill="both", expand=True)
+        notes_scroll.pack(side="right", fill="y")
+
+        btn_row = tk.Frame(dialog)
+        btn_row.pack(fill="x", padx=12, pady=12)
+        tk.Button(btn_row, text="Not Now", command=dialog.destroy).pack(side="right")
+        tk.Button(
+            btn_row, text="Update Now", bg="#2563EB", fg="white",
+            activebackground="#1D4ED8", activeforeground="white", padx=10,
+            command=lambda: self._start_update(dialog, info),
+        ).pack(side="right", padx=(0, 8))
+
+    def _start_update(self, dialog: tk.Toplevel, info) -> None:
+        if self._is_idle is not None and not self._is_idle():
+            messagebox.showerror(
+                "AutoDoc — Update",
+                "Finish or stop the current recording before updating.\n\n"
+                "Applying an update requires closing AutoDoc, which would "
+                "interrupt a recording in progress.",
+                parent=dialog,
+            )
+            return
+
+        dialog.destroy()
+        self._update_btn.config(state="disabled", text="Downloading…")
+        self._update_status_var.set(f"Downloading version {info.version}…")
+
+        def _work() -> None:
+            import updater
+
+            try:
+                zip_path = updater.download_update(info)
+                ui_service.call_soon(lambda: self._on_downloaded(zip_path))
+            except updater.UpdateCheckError as exc:
+                msg = str(exc)
+                ui_service.call_soon(lambda: self._on_check_error(msg))
+
+        threading.Thread(target=_work, name="update-download", daemon=True).start()
+
+    def _on_downloaded(self, zip_path) -> None:
+        """
+        Spawn the detached updater script, then quit AutoDoc immediately —
+        see updater.py's module docstring for why the file swap can't happen
+        in-process. Nothing after quit_for_update() runs; the relaunch
+        happens from the script, not from this process.
+        """
+        import updater
+
+        self._update_status_var.set("Restarting to apply the update…")
+        updater.launch_update_and_exit(zip_path)
+        if self._quit_for_update is not None:
+            self._quit_for_update()

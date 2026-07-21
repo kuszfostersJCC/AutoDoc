@@ -99,6 +99,8 @@ def open_sessions_window(
     config: AutoDocConfig,
     get_model: Optional[Callable[[], object]] = None,
     start_resume: Optional[Callable[[Path], None]] = None,
+    is_idle: Optional[Callable[[], bool]] = None,
+    quit_for_update: Optional[Callable[[], None]] = None,
 ) -> None:
     """
     Open (or re-focus) the Sessions window as a Toplevel of the shared root.
@@ -111,6 +113,13 @@ def open_sessions_window(
         start_resume:  Callable(session_dir) that begins append-recording into
                        an existing session (PRD F5). Owned by TrayApp — only
                        it may start recordings.
+        is_idle:       Callable() -> bool, True when TrayApp's state machine
+                       is IDLE. Settings tab's "Check for Updates" refuses to
+                       apply an update while a recording/transcription is in
+                       progress.
+        quit_for_update: Callable() that cleanly shuts AutoDoc down, called by
+                       the Settings tab immediately after it spawns the
+                       detached updater script (see updater.py).
     """
     global _open_window
     if _open_window is not None and _open_window.is_alive():
@@ -123,7 +132,7 @@ def open_sessions_window(
     # Designed at 96 DPI; scaled to the real display (tiny-on-4K fix).
     win.geometry(ui_service.scaled_geometry(980, 560))
     win.minsize(ui_service.scale(760), ui_service.scale(420))
-    _open_window = SessionsWindow(win, config, get_model, start_resume)
+    _open_window = SessionsWindow(win, config, get_model, start_resume, is_idle, quit_for_update)
 
 
 # ------------------------------------------------------------------ #
@@ -137,11 +146,15 @@ class SessionsWindow:
         config: AutoDocConfig,
         get_model: Optional[Callable[[], object]] = None,
         start_resume: Optional[Callable[[Path], None]] = None,
+        is_idle: Optional[Callable[[], bool]] = None,
+        quit_for_update: Optional[Callable[[], None]] = None,
     ) -> None:
         self.root = root
         self.config = config
         self._get_model = get_model
         self._start_resume = start_resume
+        self._is_idle = is_idle
+        self._quit_for_update = quit_for_update
         self._sessions: list[dict] = []
         self._generating = False
         self._retranscribing = False
@@ -176,7 +189,9 @@ class SessionsWindow:
 
         from sessions_window.settings_panel import SettingsPanel
 
-        settings_tab = SettingsPanel(notebook, self.config)
+        settings_tab = SettingsPanel(
+            notebook, self.config, is_idle=self._is_idle, quit_for_update=self._quit_for_update
+        )
         notebook.add(settings_tab, text="  Settings  ")
 
         # ── Toolbar ──────────────────────────────────────────────── #

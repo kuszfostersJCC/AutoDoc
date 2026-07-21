@@ -355,8 +355,17 @@ class TrayApp:
                 self.config,
                 get_model=self.get_whisper_model,
                 start_resume=self.resume_recording,
+                is_idle=self.is_idle,
+                quit_for_update=self.quit,
             )
         )
+
+    def is_idle(self) -> bool:
+        """Whether it's safe to apply an update — see Settings tab's "Check
+        for Updates". Recording/transcribing mid-update risks corrupting the
+        in-progress session, so that flow refuses to proceed unless this is
+        True."""
+        return self._state == "IDLE"
 
     def quit(self) -> None:
         """Clean shutdown — callable from signal handlers or the tray menu."""
