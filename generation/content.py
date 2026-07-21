@@ -14,13 +14,37 @@ Neutral content block shapes:
 
 from pathlib import Path
 
-SYSTEM_PROMPT = """\
+from recorder.screenshot import (
+    event_is_legacy,
+    render_event_to_cache,
+    resolve_render_mode,
+)
+
+# Screenshot-handling sentence, per render mode. Injected into the system
+# prompt so the model's expectations match what the images actually look like.
+SCREENSHOT_DESCRIPTIONS = {
+    "raw": (
+        "Screenshots are unmodified screen captures. The click position for each "
+        "screenshot is given in its accompanying text label."
+    ),
+    "blurred": (
+        "Each screenshot has a privacy blur applied — the blurred areas conceal "
+        "surrounding content, while a circular clear region highlights exactly "
+        "where the user clicked."
+    ),
+    "circled": (
+        "Each screenshot is an unmodified capture with a light red circle drawn "
+        "around the exact UI element the user clicked. Treat the circled element "
+        "as the target of that step's action."
+    ),
+}
+
+_SYSTEM_PROMPT_TEMPLATE = """\
 You are a technical documentation assistant. Your task is to write clear, \
 step-by-step workflow documentation for non-technical staff at an educational institution.
 
 You will receive a narration of a workflow and, in most cases, a sequence of screenshots. \
-Each screenshot has a privacy blur applied — the blurred areas conceal surrounding \
-content, while a circular clear region highlights exactly where the user clicked. \
+{screenshot_description} \
 If no screenshots are provided, use the narration alone as your complete source of truth.
 
 Produce a markdown document in this exact structure:
@@ -38,7 +62,7 @@ Write "None" if nothing is mentioned.]
 
 ### Step 1: [Short imperative title, e.g. "Open the Student Information System"]
 [Plain-language explanation. Describe the action and where on screen to find the \
-relevant control — reference what is visible in the unblurred area of the screenshot \
+relevant control — reference what is visible in the screenshot \
 (e.g., "the blue Submit button in the upper-right corner"). One action per step.]
 
 ### Step 2: [Short imperative title]
@@ -53,44 +77,105 @@ Rules:
 - Number steps sequentially starting at 1.
 - Each step corresponds to ONE distinct action or click.
 - Use the narration as the primary source of truth; screenshots confirm visual context.
+- Some screenshots include a "clicked element (ground truth)" label captured directly \
+from the operating system at click time. Treat these element names and window titles as \
+authoritative: use them verbatim when naming buttons, fields, menus, and windows in steps. \
+Never contradict a ground-truth label based on what you think you see in the image.
 - Describe click locations in plain terms ("the Search tab at the top of the page"), \
 not pixel coordinates.
 - Do NOT invent steps that are not evidenced by the narration or screenshots.
-- Do NOT include any markdown image syntax or image references in your output.
+- PLACING SCREENSHOTS: each screenshot is labeled with an id like evt_0004. To include \
+a screenshot in the document, put the token {{{{screenshot:evt_0004}}}} COMPLETELY ALONE \
+on its own line, immediately after the step text it illustrates. Never put a token inside \
+a sentence, inside parentheses, or on the same line as any other text — wrong: \
+"Click Save. (See {{{{screenshot:evt_0004}}}})", right: the sentence on one line, then the \
+token by itself on the next line. Use each screenshot at most once, keep tokens in \
+chronological order, and include a screenshot for every step where one exists.
+- Do NOT use markdown image syntax (![](...)) — screenshot tokens are the only way to \
+reference images.
 - Output ONLY the markdown document — no preamble, no closing remarks.\
 """
 
 
-def _screenshot_blocks(events: list[dict], session_dir: Path) -> list[dict]:
-    """Return neutral image blocks for all surviving screenshot events."""
-    blocks: list[dict] = []
-    screenshots = sorted(
-        [e for e in events if e.get("type") == "screenshot"],
-        key=lambda e: e.get("timestamp_offset_ms", 0),
-    )
-    for event in screenshots:
-        img_path = session_dir / event["data"]["filename"]
-        if not img_path.exists():
-            continue
-        offset_s = event["timestamp_offset_ms"] / 1000
-        click_type = event["data"].get("click_type", "left")
-        cx = event["data"].get("click_x", "?")
-        cy = event["data"].get("click_y", "?")
+def resolve_session_mode(session_data: dict, config) -> str:
+    """
+    The render mode this session's images will actually use. Legacy sessions
+    (pre-raw-storage, destructively blurred PNGs) are always "blurred"
+    regardless of settings, because that's what the pixels are.
+    """
+    events = session_data.get("events", [])
+    screenshots = [e for e in events if e.get("type") == "screenshot"]
+    if screenshots and all(event_is_legacy(e) for e in screenshots):
+        return "blurred"
+    return resolve_render_mode(session_data, config)
 
-        blocks.append({
+
+def get_system_prompt(mode: str) -> str:
+    """System prompt with the screenshot description matching the render mode."""
+    desc = SCREENSHOT_DESCRIPTIONS.get(mode, SCREENSHOT_DESCRIPTIONS["blurred"])
+    return _SYSTEM_PROMPT_TEMPLATE.format(screenshot_description=desc)
+
+
+def _describe_click(event: dict) -> str:
+    """
+    Human-readable description of the interaction behind a screenshot event.
+
+    When the recorder captured the clicked element (data.ui_element, PRD F1),
+    that is included as GROUND TRUTH — deterministic at capture time via
+    Win32/UI Automation, unlike anything inferred from pixels. The system
+    prompt instructs the model to prefer these names over visual guessing.
+    """
+    data = event.get("data", {})
+    click_type = data.get("click_type", "left")
+
+    if click_type == "imported":
+        # Appended post-hoc via recorder/session.py::import_screenshots() —
+        # no click ever happened, so don't tell the model one did (e.g. a
+        # phone photo of a BIOS screen manually added to a session).
+        return "manually imported photo (no click coordinates — added to this session after recording)"
+
+    cx = data.get("click_x", "?")
+    cy = data.get("click_y", "?")
+
+    if click_type == "manual":
+        desc = f"manual capture at screen position ({cx}, {cy})"
+    else:
+        desc = f"{click_type}-click at screen position ({cx}, {cy})"
+
+    ui = data.get("ui_element") or {}
+    if ui.get("element_name"):
+        role = f" {ui['element_role']}" if ui.get("element_role") else ""
+        desc += f" — clicked element (ground truth): the{role} \"{ui['element_name']}\""
+    if ui.get("window_title"):
+        desc += f" — window: \"{ui['window_title']}\""
+    if ui.get("app_name"):
+        desc += f" ({ui['app_name']})"
+    return desc
+
+
+def _screenshot_event_blocks(event: dict, session_dir: Path, mode: str, config) -> list[dict]:
+    """Neutral text+image blocks for one screenshot event, rendered per mode."""
+    img_path = render_event_to_cache(session_dir, event, mode, config)
+    if img_path is None:
+        return []
+    offset_s = event["timestamp_offset_ms"] / 1000
+    return [
+        {
             "type": "text",
             "text": (
-                f"[SCREENSHOT at {offset_s:.1f}s — "
-                f"{click_type}-click at screen position ({cx}, {cy})]:"
+                f"[SCREENSHOT id={event['event_id']} at {offset_s:.1f}s — "
+                f"{_describe_click(event)}]:"
             ),
-        })
-        blocks.append({"type": "image", "path": img_path})
-    return blocks
+        },
+        {"type": "image", "path": img_path},
+    ]
 
 
-def build_content_blocks(session_data: dict, session_dir: Path) -> list[dict]:
+def build_content_blocks(session_data: dict, session_dir: Path, config) -> list[dict]:
     """
-    Build the full list of neutral content blocks for a session.
+    Build the full list of neutral content blocks for a session. Screenshot
+    images are rendered (blur/circle/raw per the session's mode) into
+    session_dir/rendered/ and the rendered paths are what backends read.
 
     If edited_full_transcript is present, it is placed first as a complete
     narration block, followed by screenshots in chronological order.
@@ -101,6 +186,7 @@ def build_content_blocks(session_data: dict, session_dir: Path) -> list[dict]:
     """
     events = session_data.get("events", [])
     edited_transcript = session_data.get("edited_full_transcript", "").strip()
+    mode = resolve_session_mode(session_data, config)
 
     if edited_transcript:
         blocks: list[dict] = [
@@ -109,7 +195,12 @@ def build_content_blocks(session_data: dict, session_dir: Path) -> list[dict]:
                 "text": f"[FULL NARRATION (user-reviewed)]:\n{edited_transcript}",
             }
         ]
-        blocks += _screenshot_blocks(events, session_dir)
+        screenshots = sorted(
+            [e for e in events if e.get("type") == "screenshot"],
+            key=lambda e: e.get("timestamp_offset_ms", 0),
+        )
+        for event in screenshots:
+            blocks += _screenshot_event_blocks(event, session_dir, mode, config)
         return blocks
 
     # No edited transcript — interleave Whisper segments with screenshots.
@@ -128,19 +219,6 @@ def build_content_blocks(session_data: dict, session_dir: Path) -> list[dict]:
                 })
 
         elif etype == "screenshot":
-            img_path = session_dir / event["data"]["filename"]
-            if not img_path.exists():
-                continue
-            click_type = event["data"].get("click_type", "left")
-            cx = event["data"].get("click_x", "?")
-            cy = event["data"].get("click_y", "?")
-            blocks.append({
-                "type": "text",
-                "text": (
-                    f"[SCREENSHOT at {offset_s:.1f}s — "
-                    f"{click_type}-click at screen position ({cx}, {cy})]:"
-                ),
-            })
-            blocks.append({"type": "image", "path": img_path})
+            blocks += _screenshot_event_blocks(event, session_dir, mode, config)
 
     return blocks

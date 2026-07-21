@@ -1,6 +1,11 @@
 """
 generation/output_writer.py — Write the generated markdown to the output folder.
 
+DEPRECATED since v1.1 (PRD F2): generation/renderers.py is the output path
+now — it writes md/html/docx with screenshots embedded. This module is kept
+only so any straggler callers keep working; it writes plain markdown with
+screenshot tokens left as-is. Do not add features here.
+
 The output filename is derived from the document's H1 heading so the file is
 human-readable (e.g., "How_to_Submit_a_Grade_Change.md"). If the title can't
 be parsed, the session ID is used as a fallback.

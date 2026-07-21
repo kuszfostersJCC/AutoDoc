@@ -55,6 +55,44 @@ def _setup_logging() -> None:
     )
 
 
+def _enable_windows_dpi_awareness() -> None:
+    """
+    Declare Per-Monitor V2 DPI awareness BEFORE any window exists.
+
+    Two effects, both required:
+    1. UI scaling: with DPI awareness on, ui_service measures the real DPI
+       and scales Tk fonts/geometry — otherwise a 4K display at 150-200%
+       renders the whole app tiny (reported 2026-07-14).
+    2. Coordinate correctness: without awareness, Windows *virtualizes*
+       coordinates for this process — pynput click positions and Win32
+       WindowFromPoint would disagree with mss's physical-pixel captures on
+       scaled displays, silently offsetting blur/circle positions and
+       click-target lookups. Awareness makes everything physical pixels.
+
+    Fallback chain: Per-Monitor V2 (Win10 1703+) → Per-Monitor (Win 8.1+) →
+    system DPI aware (legacy). All failures are non-fatal.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:  # S_OK
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 def _install_crash_visibility() -> None:
     """
     Route otherwise-invisible failures into autodoc.log.
@@ -108,6 +146,12 @@ _DEFAULT_CONFIG = {
     "whisper_model": "base",
     "focus_radius_px": 200,
     "blur_strength": 15,
+    "screenshot_mode": "blurred",
+    "circle_radius_px": 36,
+    "output_formats": ["docx", "html", "md"],
+    "manual_capture_hotkey": "<ctrl>+<shift>+s",
+    "pause_hotkey": "<ctrl>+<alt>+p",
+    "stop_hotkey": "<ctrl>+<shift>+e",
     "sessions_dir": "sessions",
     "output_dir": "output",
     "claude_model": "claude-sonnet-5",
@@ -162,6 +206,7 @@ def _prompt_for_api_key() -> str | None:
 # ------------------------------------------------------------------ #
 
 def main() -> None:
+    _enable_windows_dpi_awareness()  # must precede ANY window/Tk creation
     _setup_logging()
     _install_crash_visibility()
     config_path = get_app_dir() / "config.json"

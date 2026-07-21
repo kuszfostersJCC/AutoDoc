@@ -12,7 +12,7 @@ from pathlib import Path
 
 from config import AutoDocConfig
 from generation.backends import get_backend
-from generation.content import SYSTEM_PROMPT, build_content_blocks
+from generation.content import build_content_blocks, get_system_prompt, resolve_session_mode
 
 
 def generate_documentation(
@@ -34,12 +34,13 @@ def generate_documentation(
         generation.backends.base.DocGenerationError: On backend-level failures
             (bad credentials, unreachable server, malformed response, etc.).
     """
-    content_blocks = build_content_blocks(session_data, session_dir)
+    content_blocks = build_content_blocks(session_data, session_dir, config)
     if not content_blocks:
         raise ValueError(
             "No usable content found in this session.\n"
             "The session may have no transcript and no screenshots."
         )
 
+    mode = resolve_session_mode(session_data, config)
     backend = get_backend(config)
-    return backend.generate(SYSTEM_PROMPT, content_blocks)
+    return backend.generate(get_system_prompt(mode), content_blocks)

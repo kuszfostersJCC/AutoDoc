@@ -13,10 +13,12 @@ The same folder works for two workflows:
   • Manual (Claude Desktop) — user uploads INSTRUCTIONS.md + all images to a conversation
   • Automated (Cowork agent) — scheduled task scans exports/, finds processed=false, handles each
 
-zip_export_folder() additionally packs that folder into a single .zip. This is for
-the "coworker records, admin generates" handoff: a non-technical coworker with no API
-key/local model configured can hit Export, then just attach one .zip file to an email
-or Teams message instead of gathering a folder of loose images.
+zip_export_folder() packs that folder into a single .zip and (by default)
+DELETES the folder afterwards — the zip is the deliverable, and keeping both
+doubled the disk footprint for no benefit. This is for the "coworker records,
+admin generates" handoff: a non-technical coworker with no API key/local model
+configured can hit Export, then just attach one .zip file to an email or Teams
+message instead of gathering a folder of loose images.
 """
 
 import json
@@ -24,6 +26,8 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+
+from recorder.screenshot import render_event_to_cache
 
 
 # ------------------------------------------------------------------ #
@@ -67,7 +71,7 @@ Produce a markdown document in this exact structure:
 ### Step 1: [Short imperative title]
 [Plain-language explanation. One action per step. Describe on-screen locations in plain
 terms ("the blue Save button in the upper-right corner"). Reference visible details in
-the screenshot's unblurred circular region.]
+the screenshots.]
 
 ### Step 2: ...
 
@@ -102,9 +106,7 @@ Rules:
 
 ## Screenshots
 
-The following images are included in the `images/` subfolder. Each screenshot has a
-privacy blur applied — the background is blurred and a circular clear window highlights
-exactly where the user clicked.
+The following images are included in the `images/` subfolder. {screenshot_description}
 
 {screenshot_table}
 """
@@ -189,19 +191,42 @@ def export_session(
     session_data: dict,
     session_dir: Path,
     exports_root: Path,
+    config=None,
 ) -> Path:
     """
     Build a self-contained export folder from a session.
+
+    Screenshots are RENDERED (raw/blurred/circled, per the session's saved
+    render mode) into the export — the raw on-disk PNGs never leave the
+    session folder unless the mode is explicitly "raw". This matters: the
+    export is the artifact that gets emailed/uploaded, so it must respect
+    the privacy mode even though local storage is raw.
 
     Args:
         session_data:   Parsed session.json dict.
         session_dir:    Source session folder (where screenshots live).
         exports_root:   Root exports/ directory (created if absent).
+        config:         AutoDocConfig; supplies the default render mode and
+                        blur/circle parameters. None falls back to legacy
+                        copy-as-is behaviour.
 
     Returns:
         Path to the created export folder.
     """
     exports_root.mkdir(parents=True, exist_ok=True)
+
+    if config is not None:
+        from generation.content import SCREENSHOT_DESCRIPTIONS, resolve_session_mode
+        render_mode = resolve_session_mode(session_data, config)
+        screenshot_description = SCREENSHOT_DESCRIPTIONS.get(
+            render_mode, SCREENSHOT_DESCRIPTIONS["blurred"]
+        )
+    else:
+        render_mode = None  # copy files untouched
+        screenshot_description = (
+            "Each screenshot has a privacy blur applied — the background is blurred "
+            "and a circular clear window highlights exactly where the user clicked."
+        )
 
     session_id = session_data.get("session_id", "session")
     name = session_data.get("name") or session_id
@@ -220,8 +245,11 @@ def export_session(
     )
     copied_images: list[dict] = []
     for evt in screenshots:
-        src = session_dir / evt["data"]["filename"]
-        if not src.exists():
+        if render_mode is not None:
+            src = render_event_to_cache(session_dir, evt, render_mode, config)
+        else:
+            src = session_dir / evt["data"]["filename"]
+        if src is None or not src.exists():
             continue
         dest = images_dir / src.name
         shutil.copy2(src, dest)
@@ -254,9 +282,13 @@ def export_session(
     duration = _fmt_duration(started_raw, stopped_raw)
 
     # ── Write INSTRUCTIONS.md ─────────────────────────────────── #
-    is_transcript_only = session_data.get("session_type") == "transcript_only"
-
-    if is_transcript_only:
+    # Branch on whether the session ACTUALLY has screenshots (copied_images),
+    # not on session_type. session_type only ever meant "were clicks
+    # auto-captured" — a "transcript_only" session can have screenshots now
+    # via recorder/session.py::import_screenshots(), and that must still get
+    # the full image-aware template. See session_editor.py's module
+    # docstring for the same reasoning applied to the editor UI.
+    if not copied_images:
         instructions = _INSTRUCTIONS_TRANSCRIPT_ONLY_TEMPLATE.format(
             session_name=name,
             session_id=session_id,
@@ -272,6 +304,7 @@ def export_session(
             duration=duration,
             narration=narration or "_No narration was recorded for this session._",
             screenshot_table=screenshot_table,
+            screenshot_description=screenshot_description,
         )
     (export_dir / "INSTRUCTIONS.md").write_text(instructions, encoding="utf-8")
 
@@ -350,10 +383,11 @@ def _fmt_duration(started: str, stopped: str) -> str:
 # Zipping (for the "coworker exports, admin generates" handoff)       #
 # ------------------------------------------------------------------ #
 
-def zip_export_folder(export_dir: Path) -> Path:
+def zip_export_folder(export_dir: Path, delete_folder: bool = True) -> Path:
     """
     Pack an export folder (as produced by export_session) into a single
-    .zip sitting alongside it, e.g. exports/My_Workflow_20260406_173051.zip.
+    .zip sitting alongside it, e.g. exports/My_Workflow_20260406_173051.zip,
+    then delete the folder (the zip is the only deliverable).
 
     Returns the path to the created zip file.
     """
@@ -364,4 +398,6 @@ def zip_export_folder(export_dir: Path) -> Path:
         root_dir=str(export_dir.parent),
         base_dir=export_dir.name,
     )
+    if delete_folder:
+        shutil.rmtree(export_dir, ignore_errors=True)
     return Path(zip_path)

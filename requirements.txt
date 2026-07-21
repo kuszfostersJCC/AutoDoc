@@ -19,6 +19,9 @@ pystray>=0.19.5
 sounddevice>=0.4.6
 numpy>=1.24.0
 openai-whisper>=20231117
+# v1.1 (see PRD-v1.1-features.md)
+comtypes>=1.4.0        # F1: UI Automation click-target capture
+python-docx>=1.1.0     # F2: Word (.docx) export with embedded screenshots
 
 # Build tooling
 pyinstaller>=6.0.0

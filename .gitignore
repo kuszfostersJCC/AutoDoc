@@ -194,3 +194,5 @@ config.json
 
 # Runtime diagnostic log (written beside the exe)
 autodoc.log
+PRD-v1.1-features.md
+HANDOFF.md
