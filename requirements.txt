@@ -9,19 +9,31 @@
 #
 #   pip install -r requirements.txt
 #
+# NOTE: adding a line here does NOTHING for the packaged build until it is
+# actually pip-installed into the build venv. A missing module is only a
+# WARNING to PyInstaller — the build reports "Build complete!" and produces an
+# exe that dies on launch with ModuleNotFoundError. autodoc.spec hard-aborts
+# on a missing PySide6 for exactly this reason. Quickest check before any
+# rebuild: `python main.py` from source.
 # ─────────────────────────────────────────────────────────────────────
 
 anthropic>=0.40.0
 mss>=9.0.2
 Pillow>=10.0.0
 pynput>=1.7.7
-pystray>=0.19.5
 sounddevice>=0.4.6
 numpy>=1.24.0
 openai-whisper>=20231117
 # v1.1 (see PRD-v1.1-features.md)
 comtypes>=1.4.0        # F1: UI Automation click-target capture
 python-docx>=1.1.0     # F2: Word (.docx) export with embedded screenshots
+
+# UI — PySide6 / Qt Widgets (2026-07-24; replaced tkinter + pystray).
+# QSystemTrayIcon supersedes pystray entirely: one toolkit, one event loop,
+# one Windows message pump. Do not re-add pystray.
+# PySide6 (LGPL) deliberately, NOT PyQt6 (GPL/commercial) — AutoDoc is
+# distributed as a binary to staff, and PyQt6's licensing does not fit that.
+PySide6>=6.6.0
 
 # Build tooling
 pyinstaller>=6.0.0
