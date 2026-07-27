@@ -1,155 +1,116 @@
 """
-ui_service.py — Single shared Tk root + dedicated UI thread for the whole app.
+ui_service.py — the thread seam between AutoDoc's worker threads and its Qt UI.
 
-WHY THIS EXISTS (read before "simplifying" back to multiple Tk() roots):
-Before 2026-07-08 the app created a separate tk.Tk() root — each with its own
-Tcl interpreter and mainloop — in a separate daemon thread for the naming
-dialog, the Sessions window, and the Session editor. Three Tcl interpreters
-across three threads. Tcl aborts the whole process (Tcl_Panic — a hard native
-crash that no Python except/excepthook/log handler can see) when interpreter
-state is touched from the wrong thread. The most common trigger: any
-tkinter.messagebox call WITHOUT an explicit parent= — it binds to the
-process-wide "default root", i.e. whichever Tk() happened to be created first,
-which usually lives in a DIFFERENT thread. Observed symptom: clicking
-"Generate Documentation" without a working backend showed the (correctly
-caught) error via messagebox → whole app vanished, tray icon and all, with an
-empty log.
+WHY THIS STILL EXISTS AFTER THE QT PORT (2026-07-24):
+Under tkinter this module existed to enforce "exactly one Tk root, on one
+thread", because touching a Tcl interpreter from the wrong thread aborts the
+process at the native level (Tcl_Panic — uncatchable from Python, empty log,
+tray icon just vanishes). Qt has the same underlying constraint with a
+different failure mode: QWidget and everything that touches one may only be
+used from the thread that created QApplication (the main thread). Violating it
+doesn't reliably crash — it corrupts paint state, deadlocks, or crashes
+*later* somewhere unrelated, which is strictly harder to debug than the Tcl
+abort was.
 
-The fix is architectural, not a guard clause:
-  * exactly ONE hidden Tk root, owned by ONE dedicated UI thread (started here)
-  * every window in the app is a Toplevel of that root
-  * every messagebox/dialog passes an explicit parent
-  * other threads NEVER touch Tk directly — they hand callables to
-    call_soon(), which a root.after() pump running inside the UI thread
-    drains. Even root.after() itself is never invoked cross-thread.
+So the rule is unchanged in spirit and the public API is unchanged on purpose:
 
-pystray keeps the process's main thread (its Win32 backend requires that);
-this UI thread is the only other thread allowed to run Tk code.
+    worker thread  ──▶  ui_service.call_soon(fn)  ──▶  fn() runs on main thread
+
+Every existing worker-thread call site (doc generation, retranscribe, update
+check/download, model-list fetch) keeps working verbatim. Nothing in
+recorder/, transcription/, or generation/ imports Qt or knows the UI exists.
+
+HOW IT WORKS: a single _Marshal QObject lives on the main thread. call_soon()
+emits its `invoke` signal carrying the callable. Because the connection is
+Qt.QueuedConnection, Qt posts the call to the *receiver's* thread affinity
+(the main thread) and returns immediately — this is the sanctioned way to
+cross threads in Qt, and emitting a signal from a non-main thread is safe.
+The queue draining is Qt's own event loop; there is no polling timer like the
+old root.after(30ms) pump.
+
+WHAT CHANGED FROM THE TK VERSION:
+  * start()/stop() are gone — QApplication owns the loop now, and it lives on
+    the process main thread (tray/tray_app.py no longer runs a second pump;
+    pystray is gone entirely).
+  * get_root() is gone. Nothing should reach for a global parent window; pass
+    an explicit parent, or use get_main_window() when a dialog genuinely needs
+    the app's main window as parent.
+  * scale()/scaled_geometry() are gone. Qt does its own DPI scaling, so
+    widget sizes are authored in logical pixels and need no manual factor.
+    NOTE: this does NOT apply to screenshot/click coordinates — those are
+    physical pixels handled in recorder/ via mss+pynput and are unaffected by
+    Qt. See main.py::_enable_windows_dpi_awareness for why ordering matters.
 """
 
 import logging
-import queue
-import threading
-import tkinter as tk
 from typing import Callable, Optional
+
+from PySide6.QtCore import QObject, Qt, Signal
 
 log = logging.getLogger(__name__)
 
-_PUMP_INTERVAL_MS = 30
-
-_root: Optional[tk.Tk] = None
-_ready = threading.Event()
-_thread: Optional[threading.Thread] = None
-_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
-
-# UI scale factor: real DPI / 96. Set once when the root is created (requires
-# the DPI awareness declared in main.py — without it Windows lies about DPI).
-_scale = 1.0
+_marshal: Optional["_Marshal"] = None
+_main_window = None
 
 
-def start() -> None:
-    """Start the UI thread and block until the hidden root exists (max 10s)."""
-    global _thread
-    if _thread is not None and _thread.is_alive():
-        return
-    _thread = threading.Thread(target=_run, name="tk-ui", daemon=True)
-    _thread.start()
-    if not _ready.wait(timeout=10):
-        log.error("ui_service.start: UI thread did not become ready within 10s")
+class _Marshal(QObject):
+    """Carries callables from any thread onto the thread that owns this object."""
 
+    invoke = Signal(object)
 
-def _run() -> None:
-    global _root
-    _root = tk.Tk()
-    _root.withdraw()  # The shared root itself is never shown.
-    _apply_dpi_scaling(_root)
-    _root.after(_PUMP_INTERVAL_MS, _pump)
-    _ready.set()
-    log.info("ui_service: UI thread running")
-    _root.mainloop()
-    log.info("ui_service: UI thread mainloop exited")
+    def __init__(self) -> None:
+        super().__init__()
+        # QueuedConnection is the whole point: it makes emit() from a worker
+        # thread post an event to THIS object's thread rather than running the
+        # slot inline on the caller's thread. A DirectConnection here would
+        # silently reintroduce exactly the cross-thread widget access this
+        # module exists to prevent.
+        self.invoke.connect(self._run, Qt.QueuedConnection)
 
-
-def _apply_dpi_scaling(root: tk.Tk) -> None:
-    """
-    Size the UI for the actual display DPI.
-
-    winfo_fpixels('1i') reports true pixels-per-inch only because main.py
-    declared DPI awareness before any window existed. Three knobs, all
-    needed: 'tk scaling' (point-sized fonts), explicit resize of Tk's named
-    fonts (on Windows they're pixel-sized and IGNORE tk scaling — the reason
-    naive fixes don't work), and ttk Treeview row height (also pixel-based).
-    Window geometries are handled by callers via scale().
-    """
-    global _scale
-    try:
-        dpi = root.winfo_fpixels("1i")
-        _scale = max(1.0, dpi / 96.0)
-        root.tk.call("tk", "scaling", dpi / 72.0)
-        log.info("ui_service: display dpi=%.0f scale=%.2f", dpi, _scale)
-
-        if _scale > 1.05:
-            from tkinter import font as tkfont
-            from tkinter import ttk
-
-            for name in (
-                "TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
-                "TkTooltipFont", "TkFixedFont", "TkIconFont", "TkCaptionFont",
-            ):
-                try:
-                    f = tkfont.nametofont(name, root=root)
-                    f.configure(size=int(f.cget("size") * _scale))
-                except tk.TclError:
-                    pass
-            ttk.Style(root).configure("Treeview", rowheight=int(20 * _scale))
-    except Exception:
-        _scale = 1.0
-        log.exception("ui_service: DPI scaling failed — using 1.0")
-
-
-def scale(px: int) -> int:
-    """Scale a 96-DPI pixel measurement to the actual display."""
-    return int(px * _scale)
-
-
-def scaled_geometry(width: int, height: int) -> str:
-    """Tk geometry string for a window designed at 96 DPI."""
-    return f"{scale(width)}x{scale(height)}"
-
-
-def _pump() -> None:
-    """Drain queued callables. Runs inside the UI thread via root.after."""
-    while True:
-        try:
-            fn = _queue.get_nowait()
-        except queue.Empty:
-            break
+    @staticmethod
+    def _run(fn: Callable[[], None]) -> None:
         try:
             fn()
         except Exception:
-            # A failing UI callback must never kill the pump.
+            # A failing UI callback must never take down the event loop.
             log.exception("ui_service: queued UI callback raised")
-    if _root is not None:
-        _root.after(_PUMP_INTERVAL_MS, _pump)
+
+
+def init() -> None:
+    """
+    Create the marshaller. MUST be called from the main thread, after
+    QApplication exists and before any worker thread can call call_soon().
+    """
+    global _marshal
+    if _marshal is not None:
+        return
+    _marshal = _Marshal()
+    log.info("ui_service: marshaller ready on main thread")
 
 
 def call_soon(fn: Callable[[], None]) -> None:
     """
-    Schedule fn() to run on the UI thread. Safe to call from any thread.
-    This is the ONLY way non-UI threads may cause UI work to happen.
+    Schedule fn() to run on the Qt main thread. Safe to call from any thread.
+    This is the ONLY way non-main threads may cause UI work to happen.
     """
-    if not _ready.is_set():
-        log.warning("ui_service.call_soon: UI thread not started; dropping callback %r", fn)
+    if _marshal is None:
+        log.warning("ui_service.call_soon: not initialised; dropping callback %r", fn)
         return
-    _queue.put(fn)
+    _marshal.invoke.emit(fn)
 
 
-def get_root() -> Optional[tk.Tk]:
-    """The shared hidden root. Only touch it from code already on the UI thread."""
-    return _root
+def set_main_window(window) -> None:
+    """Record the app's main window so dialogs can parent to it."""
+    global _main_window
+    _main_window = window
 
 
-def stop() -> None:
-    """Ask the UI thread to exit its mainloop (used on app quit)."""
-    if _ready.is_set() and _root is not None:
-        _queue.put(_root.quit)
+def get_main_window():
+    """
+    The app's main window, or None if it isn't open.
+
+    Only for use as a dialog parent. Do not reach through this to poke at
+    another window's widgets from a worker thread — that's what call_soon is
+    for.
+    """
+    return _main_window

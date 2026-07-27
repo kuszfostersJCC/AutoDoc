@@ -2,16 +2,22 @@
 main.py — AutoDoc entry point.
 
 Responsibilities:
-1. Ensure config.json exists next to the executable.
-2. If the API key is blank AND we're running from source, prompt the user
-   once with a simple tkinter dialog (admin/dev convenience only).
-3. Load the validated config and hand off to the TrayApp.
+1. Declare DPI awareness before anything creates a window (see below — this
+   one is load-bearing for screenshot correctness, not just cosmetics).
+2. Create the QApplication, apply the theme, start the thread seam.
+3. Ensure config.json exists next to the executable.
+4. If the API key is blank AND we're running from source, prompt the user
+   once (admin/dev convenience only).
+5. Load the validated config and hand off to the TrayApp.
 
 Important: recording and transcription are fully local and need no API key
 or provider at all. Only "Generate Documentation" needs a working backend.
 A missing/invalid key must never block the app from launching — it should
 only surface as a friendly error at the moment someone actually clicks
 Generate (see generation/backends/ and sessions_window.py's error handling).
+
+UI stack (2026-07-24): PySide6 / Qt Widgets. All styling is governed by
+pyside6-ui-style-guide.md and lives in theme/ — see theme/__init__.py.
 """
 
 import json
@@ -19,10 +25,14 @@ import logging
 import platform
 import sys
 import threading
-import tkinter as tk
-from tkinter import messagebox, simpledialog
 
-from config import AutoDocConfig, get_app_dir, load_config, write_config
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox
+
+import ui_service
+from config import get_app_dir, load_config
+from theme import load_theme
 
 
 def _setup_logging() -> None:
@@ -57,17 +67,27 @@ def _setup_logging() -> None:
 
 def _enable_windows_dpi_awareness() -> None:
     """
-    Declare Per-Monitor V2 DPI awareness BEFORE any window exists.
+    Declare Per-Monitor V2 DPI awareness BEFORE QApplication is constructed.
 
     Two effects, both required:
-    1. UI scaling: with DPI awareness on, ui_service measures the real DPI
-       and scales Tk fonts/geometry — otherwise a 4K display at 150-200%
-       renders the whole app tiny (reported 2026-07-14).
-    2. Coordinate correctness: without awareness, Windows *virtualizes*
-       coordinates for this process — pynput click positions and Win32
-       WindowFromPoint would disagree with mss's physical-pixel captures on
-       scaled displays, silently offsetting blur/circle positions and
-       click-target lookups. Awareness makes everything physical pixels.
+    1. Coordinate correctness (the important one): without awareness, Windows
+       *virtualizes* coordinates for this process — pynput click positions and
+       Win32 WindowFromPoint would disagree with mss's physical-pixel captures
+       on scaled displays, silently offsetting blur/circle positions and
+       click-target lookups. Awareness makes all of those physical pixels.
+       None of that machinery goes through Qt, so Qt cannot fix it for us.
+    2. UI scaling: Qt6 scales widgets for the display DPI on its own, but it
+       decides how based on the process's awareness context at the time
+       QApplication is created. Setting PerMonitorV2 first means Qt inherits
+       it rather than picking its own — one decision, made here, instead of
+       two subsystems disagreeing.
+
+    ORDERING IS THE WHOLE POINT: this must run before QApplication(). Qt sets
+    process DPI awareness itself if it's still unset when QApplication is
+    constructed, and awareness cannot be changed afterwards — so if this call
+    moves below QApplication it becomes a silent no-op and the recorder's
+    coordinate math regresses on any scaled display, with correct-looking
+    screenshots that have the blur in the wrong place.
 
     Fallback chain: Per-Monitor V2 (Win10 1703+) → Per-Monitor (Win 8.1+) →
     system DPI aware (legacy). All failures are non-fatal.
@@ -91,6 +111,51 @@ def _enable_windows_dpi_awareness() -> None:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+
+
+def _set_windows_app_id() -> None:
+    """
+    Give AutoDoc its own Windows AppUserModelID.
+
+    Without this, Windows groups the app under whatever host process launched it
+    and shows THAT process's icon in the taskbar — running from source you get
+    the generic Python icon no matter what setWindowIcon() says, because the
+    taskbar button belongs to python.exe's identity, not ours. Setting an
+    explicit ID makes the taskbar button AutoDoc's own, so its icon and grouping
+    behave correctly.
+
+    Must run before any window is created. Frozen builds get their identity from
+    the exe itself, so this mainly fixes source runs — but it's harmless and
+    correct in both.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("JCC.AutoDoc")
+    except Exception:
+        pass  # Cosmetic only — never block startup over a taskbar icon.
+
+
+def _app_icon() -> QIcon:
+    """
+    The application icon, from assets/autodoc.ico (or a PNG fallback).
+
+    A multi-resolution .ico is strongly preferred over a PNG: Windows asks for
+    16/20/24/32/48/256px variants for the title bar, taskbar, Alt-Tab, and
+    Explorer, and a single-size PNG gets rescaled into a soft mess at the small
+    sizes where it's seen most.
+    """
+    assets = get_app_dir() / "assets"
+    for name in ("autodoc.ico", "autodoc.png", "icon_idle.png"):
+        path = assets / name
+        if path.exists():
+            return QIcon(str(path))
+    logging.getLogger(__name__).warning(
+        "_app_icon: no assets/autodoc.ico found — windows will use Qt's default icon"
+    )
+    return QIcon()
 
 
 def _install_crash_visibility() -> None:
@@ -177,25 +242,27 @@ def _prompt_for_api_key() -> str | None:
     Packaged builds should ship with a real key already in config.json;
     if one isn't there, the app still launches fine (see main()) and
     Generate Documentation will just show a friendly error until it is.
-    """
-    root = tk.Tk()
-    root.withdraw()  # Hide the blank root window.
 
-    messagebox.showinfo(
+    Requires QApplication to already exist (main() creates it before calling
+    this). Parent is None deliberately: no window exists this early.
+    """
+    QMessageBox.information(
+        None,
         "AutoDoc — Setup",
         "Welcome to AutoDoc!\n\n"
         "To generate documentation, an Anthropic API key is required.\n"
-        "Please enter it below."
+        "Please enter it below.",
     )
 
-    key = simpledialog.askstring(
+    key, ok = QInputDialog.getText(
+        None,
         "AutoDoc — API Key",
         "Paste your Anthropic API key (or leave blank to skip):",
-        show="*",
-        parent=root,
+        QLineEdit.Password,
     )
-    root.destroy()
-    return key.strip() if key else None
+    if not ok:
+        return None
+    return key.strip() or None
 
 
 # ------------------------------------------------------------------ #
@@ -203,9 +270,23 @@ def _prompt_for_api_key() -> str | None:
 # ------------------------------------------------------------------ #
 
 def main() -> None:
-    _enable_windows_dpi_awareness()  # must precede ANY window/Tk creation
+    _enable_windows_dpi_awareness()  # MUST precede QApplication — see docstring
+    _set_windows_app_id()            # also before any window exists
     _setup_logging()
     _install_crash_visibility()
+
+    app = QApplication(sys.argv)
+    # AutoDoc is a tray app: closing the Sessions window must NOT quit it.
+    # Without this, Qt exits as soon as the last window closes and the tray
+    # icon disappears mid-recording.
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("AutoDoc")
+    # Applies to every window and dialog in the app — title bar, taskbar,
+    # Alt-Tab. Individual windows never set their own icon.
+    app.setWindowIcon(_app_icon())
+    load_theme(app)          # Fusion + app.qss + the one setFont call
+    ui_service.init()        # thread seam; main thread only, after QApplication
+
     config_path = get_app_dir() / "config.json"
     is_frozen = getattr(sys, "frozen", False)
 
@@ -223,10 +304,10 @@ def main() -> None:
     # Packaged builds NEVER block startup or nag an end user about missing
     # credentials: recording and transcription are fully local and work with
     # no key at all, and Generate Documentation fails gracefully in place
-    # (see sessions_window.py / session_editor.py) if the backend isn't
-    # configured or the key is rejected. If you're seeing this prompt on a
-    # coworker's machine, config.json didn't get copied/filled in correctly
-    # when the app was packaged — check dist/AutoDoc/config.json.
+    # (see sessions_window.py) if the backend isn't configured or the key is
+    # rejected. If you're seeing this prompt on a coworker's machine,
+    # config.json didn't get copied/filled in correctly when the app was
+    # packaged — check dist/AutoDoc/config.json.
     if not is_frozen and provider == "anthropic" and not raw.get("api_key", "").strip():
         key = _prompt_for_api_key()
         if key:
@@ -241,30 +322,33 @@ def main() -> None:
         # Show a user-friendly error if config is malformed. This is a real
         # blocker (the file itself can't be read), unlike a merely-missing
         # API key above, so it's fine to stop here.
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
+        QMessageBox.critical(
+            None,
             "AutoDoc — Configuration Error",
             f"Failed to load config.json:\n\n{exc}\n\n"
             "Please check the file next to AutoDoc.exe.",
         )
-        root.destroy()
         sys.exit(1)
 
     import signal
 
     from tray.tray_app import TrayApp
 
-    app = TrayApp(config)
+    tray = TrayApp(config)
+    tray.start()
 
     # Allow Ctrl+C from the terminal to exit cleanly during development.
-    # pystray's Win32 message loop doesn't propagate SIGINT on its own.
-    def _handle_sigint(sig, frame):
-        app.quit()
+    # Qt's event loop blocks in C++ and never yields to the Python
+    # interpreter, so a SIGINT handler alone would never run — this no-op
+    # timer forces the interpreter awake every 200ms so pending signals get
+    # dispatched. Without it, Ctrl+C is simply ignored until the app exits.
+    signal.signal(signal.SIGINT, lambda *_: tray.quit())
+    _sigint_timer = QTimer()
+    _sigint_timer.start(200)
+    _sigint_timer.timeout.connect(lambda: None)
+    app._sigint_timer = _sigint_timer  # keep a reference alive
 
-    signal.signal(signal.SIGINT, _handle_sigint)
-
-    app.run()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,386 @@
+/* theme/app.qss — the one and only stylesheet. Loaded by theme/loader.py.
+ *
+ * Placeholders are substituted from theme/tokens.py via string.Template.
+ * (Written without a literal placeholder example so that an audit for
+ * unresolved placeholders after substitution comes back clean.)
+ * Grouped by widget class in a FIXED order (§5.9) — later rules win at equal
+ * specificity, so never reorder these groups to "fix" something; add the
+ * missing state instead.
+ *
+ * Rules that bite if forgotten:
+ *   - Hover/pressed may change background-color and color ONLY. Any
+ *     border-width/padding/margin/font change on hover causes visible jitter.
+ *   - Styling a class means styling ALL its states and subcontrols, or Fusion
+ *     draws the rest and you get half-custom/half-native widgets.
+ *   - Popups (QMenu, QComboBox QAbstractItemView, QToolTip) inherit nothing
+ *     useful and must each be styled explicitly.
+ */
+
+QWidget {
+    background-color: $bg_window;
+    color: $text;
+}
+QMainWindow, QDialog { background-color: $bg_window; }
+
+QLabel { background: transparent; }
+QLabel[role="title"]   { font-size: 15pt; font-weight: 600; color: $text; }
+QLabel[role="section"] { font-size: 11pt; font-weight: 600; color: $text; }
+QLabel[role="caption"] { font-size: 9pt;  color: $text_muted; }
+QLabel[role="danger"]  { font-size: 9pt;  color: $danger; }
+QLabel:disabled        { color: $text_disabled; }
+
+/* ---- Panels ---- */
+QFrame[panel="true"] {
+    background-color: $bg_surface;
+    border: $border_width solid $border;
+    border-radius: $radius_panel;
+}
+#thumbCard {
+    background-color: $bg_surface;
+    border: $border_width solid $border;
+    border-radius: 0px;            /* never round an image container */
+}
+/* Marked-for-deletion state. Set via a dynamic property rather than a
+ * per-widget stylesheet; because the property changes AFTER the widget is
+ * shown, the setter MUST unpolish/polish or Qt won't re-evaluate the rule. */
+#thumbCard[marked="true"] {
+    background-color: $danger_subtle;
+    border-color: $danger;
+}
+#thumbImage { background: transparent; border: none; }
+#thumbCaption { background: transparent; border: none; }
+
+/* ---- Tabs ---- */
+QTabWidget::pane {
+    border: none;
+    border-top: $border_width solid $border;
+    background-color: $bg_window;
+}
+/* The tab bar paints bg_window EXPLICITLY — it must not be transparent.
+ * Transparent leaves the band around the tabs unpainted, and in document mode
+ * nothing behind it paints either, so the strip renders as raw black. That was
+ * the "dark line cut off at the top of the window" artifact: not a border, not
+ * a design element, just an unpainted region that became visible once the tabs
+ * got a 4px top margin. The corner widget needs the same treatment — see
+ * #tabCornerActions below. */
+/* drawBase 0, NOT 1. Two things were drawing the seam under the tab bar: Qt's
+ * native tab-bar base line (drawBase) AND QTabWidget::pane's border-top. The
+ * base line is painted by Fusion in ITS colour, not a token, so it read as a
+ * darker line that the selected tab and the corner widget's background each
+ * interrupted — a line that looks "cut off" in places. The style guide warns
+ * about exactly this pairing ("mismatched base/pane borders are what produced
+ * the weird partial outline"). The pane's border-top is now the single source
+ * of that seam, in $border.
+ *
+ * If a full-width line under the tab bar ever goes missing entirely, this is
+ * the knob — but fix it by checking the pane's border-top, not by turning the
+ * base back on. */
+QTabBar { qproperty-drawBase: 0; background-color: $bg_window; }
+/* Same reason: the corner widget hosting Refresh / Open output folder is a bare
+ * QWidget in the tab-bar row, and its 4px margin strip showed the same black
+ * band until it painted its own background. */
+#tabCornerActions { background-color: $bg_window; }
+QTabBar::tab {
+    min-height: 30px;
+    padding: 0 16px;
+    /* 4px top margin, NOT 0. With no margin the tab bar sits flush against the
+     * top edge of the window's client area and the top pixel row of each tab
+     * (and of the corner-widget buttons beside them) gets clipped — it reads as
+     * the tabs overlapping the window frame. The margin also grows the tab-bar
+     * band so the 28px corner buttons are no longer squeezed into a 30px row.
+     * sessions_window.py gives the corner widget a matching 4px top margin so
+     * the two stay on the same baseline. */
+    margin: 4px 0 0 0;
+    background: transparent;
+    color: $text_muted;
+    font-size: 10pt;
+    font-weight: 500;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover:!selected { background-color: $bg_subtle; }
+QTabBar::tab:selected {
+    /* bg_surface stated explicitly (§9: "Active tab: bg_surface fill"). Left
+     * transparent, the white came from Fusion drawing its own native tab shape
+     * underneath — which also drew the native tab's left/top/right edges, the
+     * boxed-in look on the selected tab. Painting it ourselves covers that. */
+    background-color: $bg_surface;
+    color: $text;
+    border-bottom: 2px solid $accent;
+}
+/* Tabs are keyboard-navigable, and heavy QSS suppresses Fusion's native focus
+ * rect — without this, tabbing to the tab bar gives no visible indication.
+ * Uses background only: the 2px bottom border is the selected-tab signal and
+ * changing border geometry on focus would shift the tab by a pixel.
+ *
+ * :!selected is REQUIRED. This rule sits after :selected at equal specificity,
+ * so without the negation it wins on a tab that is both selected and focused —
+ * which is every tab the moment you click it — repainting the active tab
+ * bg_subtle grey instead of bg_surface white. */
+QTabBar::tab:focus:!selected { background-color: $bg_subtle; color: $text; }
+QTabBar::tab:disabled { color: $text_disabled; }
+
+/* ---- Buttons ---- */
+QPushButton {
+    min-height: 28px;
+    padding: 0 14px;
+    font-size: 10pt;
+    font-weight: 500;
+    color: $text;
+    background-color: $bg_surface;
+    border: $border_width solid $border;
+    border-radius: $radius_control;
+}
+QPushButton:hover    { background-color: $bg_subtle; }
+QPushButton:pressed  { background-color: $bg_sunken; }
+QPushButton:focus    { border: $border_width solid $accent_focus; }
+QPushButton:disabled { background-color: $bg_subtle; color: $text_disabled; }
+
+QPushButton[variant="primary"] {
+    background-color: $accent;
+    color: $text_on_accent;
+    border: $border_width solid $accent;
+}
+QPushButton[variant="primary"]:hover   { background-color: $accent_hover; border-color: $accent_hover; }
+QPushButton[variant="primary"]:pressed { background-color: $accent_press; border-color: $accent_press; }
+QPushButton[variant="primary"]:focus   { border-color: $accent_focus; }
+QPushButton[variant="primary"]:disabled{ background-color: $bg_subtle; color: $text_disabled; border-color: $border; }
+
+QPushButton[variant="quiet"] {
+    background: transparent;
+    color: $text_muted;
+    border: $border_width solid transparent;
+}
+QPushButton[variant="quiet"]:hover    { background-color: $bg_subtle; color: $text; }
+QPushButton[variant="quiet"]:pressed  { background-color: $bg_sunken; }
+QPushButton[variant="quiet"]:focus    { border-color: $accent_focus; }
+QPushButton[variant="quiet"]:disabled { color: $text_disabled; background: transparent; }
+
+QPushButton[variant="danger"] {
+    background: transparent;
+    color: $danger;
+    border: $border_width solid transparent;
+}
+QPushButton[variant="danger"]:hover    { background-color: $danger_subtle; color: $danger_hover; }
+QPushButton[variant="danger"]:pressed  { background-color: $danger_subtle; color: $danger_hover; }
+QPushButton[variant="danger"]:focus    { border-color: $accent_focus; }
+QPushButton[variant="danger"]:disabled { color: $text_disabled; background: transparent; }
+
+/* ---- Inputs ---- */
+QLineEdit, QPlainTextEdit, QSpinBox {
+    min-height: 28px;
+    padding: 0 8px;
+    background-color: $bg_surface;
+    color: $text;
+    border: $border_width solid $border;
+    border-radius: $radius_control;
+    selection-background-color: $accent;
+    selection-color: $text_on_accent;
+}
+QPlainTextEdit { padding: 8px; }
+QLineEdit:hover, QPlainTextEdit:hover, QSpinBox:hover { border-color: $border_strong; }
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus { border-color: $accent_focus; }
+QLineEdit:disabled, QPlainTextEdit:disabled, QSpinBox:disabled {
+    background-color: $bg_subtle; color: $text_disabled;
+}
+
+/* ---- Combo box ---- */
+QComboBox {
+    min-height: 28px;
+    padding: 0 8px;
+    background-color: $bg_surface;
+    color: $text;
+    border: $border_width solid $border;
+    border-radius: $radius_control;
+}
+QComboBox:hover    { border-color: $border_strong; }
+QComboBox:focus    { border-color: $accent_focus; }
+QComboBox:on       { border-color: $accent_focus; }
+QComboBox:disabled { background-color: $bg_subtle; color: $text_disabled; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    border-left: $border_width solid $border;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url($icon_dir/chevron-down.svg);
+    width: 16px;
+    height: 16px;
+}
+QComboBox::down-arrow:disabled { image: url($icon_dir/chevron-down-disabled.svg); }
+QComboBox QAbstractItemView {
+    background-color: $bg_surface;
+    color: $text;
+    border: $border_width solid $border;
+    border-radius: $radius_control;
+    padding: 4px;
+    outline: none;
+}
+QComboBox QAbstractItemView::item { min-height: 26px; padding: 0 8px; }
+QComboBox QAbstractItemView::item:selected {
+    background-color: $accent;
+    color: $text_on_accent;
+    border-radius: $radius_control;
+}
+/* Editable combo box (Settings → Local model: type an id or pick one).
+ * An editable QComboBox contains a real child QLineEdit, which would
+ * otherwise inherit the QLineEdit rule above and draw a SECOND bordered,
+ * rounded, 28px-min-height box inside the combo — the "grey box in a white
+ * box" / doubled-border look. Neutralising the child is mandatory, not
+ * cosmetic. Comes after the QLineEdit block deliberately; the descendant
+ * selector also out-specifies it, so both orderings are safe. */
+QComboBox:editable          { background-color: $bg_surface; }
+QComboBox:editable:disabled { background-color: $bg_subtle; }
+QComboBox QLineEdit {
+    border: none;
+    background: transparent;
+    padding: 0;
+    min-height: 0;
+    color: $text;
+    selection-background-color: $accent;
+    selection-color: $text_on_accent;
+}
+QComboBox QLineEdit:disabled { color: $text_disabled; }
+
+/* Settings fields holding long values (a URL, a GGUF-derived model id). These
+ * need real width to be readable — at the default sizeHint the endpoint
+ * truncated to "http://172.20.28.2(" and the model id to "4b-fast". Set here
+ * via object name rather than setMinimumWidth in Python, which is the
+ * sanctioned way to make one widget differ (§1.2) and keeps sizes in the
+ * theme. They are minimums, so the fields still shrink gracefully with the
+ * window rather than pinning it wider. */
+#settingsEndpoint { min-width: 320px; }
+#settingsModel    { min-width: 240px; }
+
+/* ---- Splitter (session editor: transcript | screenshots) ----
+ * The handle is a TRANSPARENT 8px gutter, not a painted bar. A solid 4px grey
+ * bar sat flush against both panes with a 0px gap, so it read as a divider
+ * jammed into the text beside it. 8px of empty space separates the panes
+ * cleanly and simultaneously gives a bigger drag target; the fill only appears
+ * on hover/press, which is also the affordance that says "this is draggable".
+ * Colour-only state changes, so nothing shifts by a pixel on hover (§5.3). */
+QSplitter { background: transparent; }
+QSplitter::handle            { background-color: transparent; }
+QSplitter::handle:horizontal { width: 8px; }
+QSplitter::handle:vertical   { height: 8px; }
+QSplitter::handle:hover      { background-color: $bg_subtle; }
+QSplitter::handle:pressed    { background-color: $accent_subtle; }
+QSplitter::handle:disabled   { background-color: transparent; }
+
+/* ---- Check box ---- */
+QCheckBox { spacing: 8px; background: transparent; }
+QCheckBox::indicator {
+    width: 16px; height: 16px;
+    background-color: $bg_surface;
+    border: $border_width solid $border_strong;
+    border-radius: 3px;
+}
+QCheckBox::indicator:unchecked:hover { border-color: $accent_focus; }
+/* Keyboard focus must be visible on the indicator — a focused checkbox with
+ * no outline is invisible to anyone tabbing through the form. Border COLOR
+ * only; changing border-width here would resize the 16px indicator. */
+QCheckBox::indicator:focus { border-color: $accent_focus; }
+QCheckBox::indicator:checked {
+    background-color: $accent;
+    border-color: $accent;
+    image: url($icon_dir/check.svg);
+}
+QCheckBox::indicator:checked:hover { background-color: $accent_hover; border-color: $accent_hover; }
+QCheckBox::indicator:disabled { background-color: $bg_subtle; border-color: $border; }
+QCheckBox::indicator:checked:disabled { background-color: $border_strong; border-color: $border_strong; }
+QCheckBox:disabled { color: $text_disabled; }
+
+/* ---- Table ---- */
+QTableView {
+    background-color: $bg_surface;
+    alternate-background-color: $bg_surface;
+    color: $text;
+    border: $border_width solid $border;
+    border-radius: 0px;
+    gridline-color: transparent;
+    outline: none;
+    selection-background-color: $accent;
+    selection-color: $text_on_accent;
+}
+QTableView::item {
+    padding: 0 8px;               /* no vertical padding — row height owns that */
+    border: none;
+}
+QTableView::item:hover           { background-color: $bg_subtle; }
+QTableView::item:selected        { background-color: $accent; color: $text_on_accent; }
+QTableView::item:selected:!active{ background-color: $accent_subtle; color: $text; }
+
+QHeaderView { background: transparent; border: none; }
+QHeaderView::section {
+    min-height: 28px;
+    padding: 0 8px;
+    background-color: $bg_subtle;
+    color: $text_muted;
+    font-weight: 600;
+    border: none;
+    border-bottom: $border_width solid $border;
+    border-right: $border_width solid $border;
+}
+QHeaderView::section:last { border-right: none; }
+QTableCornerButton::section { background-color: $bg_subtle; border: none; }
+
+/* ---- Menus (tray context menu — a separate top-level widget, inherits
+ *      nothing from the rules above) ---- */
+QMenu {
+    background-color: $bg_surface;
+    color: $text;
+    border: $border_width solid $border;
+    border-radius: $radius_control;
+    padding: 4px;
+}
+QMenu::item {
+    min-height: 28px;
+    padding: 0 24px;
+    background: transparent;
+    border-radius: $radius_control;
+}
+QMenu::item:selected { background-color: $accent; color: $text_on_accent; }
+QMenu::item:disabled { color: $text_disabled; background: transparent; }
+QMenu::separator {
+    height: $border_width;
+    background-color: $border;
+    margin: 4px 8px;
+}
+QMenu::icon { padding-left: 8px; }
+
+/* ---- Scroll bars ---- */
+QScrollBar:vertical {
+    background: transparent; width: 12px; margin: 0;
+}
+QScrollBar::handle:vertical {
+    background-color: $border_strong; min-height: 32px;
+    border-radius: 6px; margin: 2px;
+}
+QScrollBar::handle:vertical:hover { background-color: $text_muted; }
+/* Dragging must look different from hovering, or the scrollbar feels dead
+ * while you're actually holding it. Color only — margin/radius changes here
+ * would make the handle appear to resize mid-drag. */
+QScrollBar::handle:vertical:pressed { background-color: $text; }
+QScrollBar:horizontal {
+    background: transparent; height: 12px; margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background-color: $border_strong; min-width: 32px;
+    border-radius: 6px; margin: 2px;
+}
+QScrollBar::handle:horizontal:hover { background-color: $text_muted; }
+QScrollBar::handle:horizontal:pressed { background-color: $text; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; border: none; background: none; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+
+/* ---- Scroll area / misc ---- */
+QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QStatusBar { background-color: $bg_window; color: $text_muted; border-top: $border_width solid $border; }
+QStatusBar::item { border: none; }
+QToolTip {
+    background-color: $text; color: $bg_surface;
+    border: none; padding: 6px 8px;
+}
