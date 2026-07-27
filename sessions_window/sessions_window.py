@@ -1,20 +1,22 @@
 """
-sessions_window/sessions_window.py — Sessions browser UI.
+sessions_window/sessions_window.py — Sessions browser UI (PySide6).
 
-A tkinter window listing all saved sessions. From here the user can:
-  • Edit  — opens the built-in session editor (transcript + screenshot review)
-  • Generate Documentation — sends the session to the configured backend
+A window listing all saved sessions. From here the user can:
+  • Edit  — opens the built-in session editor (sessions_window/session_editor.py)
+  • Generate documentation — sends the session to the configured backend
   • Retranscribe — re-runs Whisper on the saved audio (recovery path for
     sessions whose transcription failed or timed out)
-  • Export / Delete
+  • Record more / Export / Delete
 
 THREADING MODEL (do not regress — see ui_service.py for the full story):
-open_sessions_window() must be called ON the ui_service UI thread (the tray
-schedules it via ui_service.call_soon). The window is a Toplevel of the shared
-hidden root — NOT its own Tk() root in its own thread; that pattern caused
-hard Tcl-level process crashes. Worker threads (generation, retranscribe)
-never touch Tk directly: they report back via ui_service.call_soon. Every
-messagebox passes an explicit parent for the same reason.
+Widgets may only be touched from the Qt main thread. open_sessions_window()
+must therefore be called on it (the tray schedules it via
+ui_service.call_soon). Worker threads (generation, retranscribe) never touch
+widgets: they report back via ui_service.call_soon.
+
+STYLING: governed entirely by pyside6-ui-style-guide.md + theme/app.qss. This
+module sets object names and dynamic properties; it must never call
+setStyleSheet, name a color, or set a font.
 """
 
 import json
@@ -25,18 +27,56 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox
-import tkinter as tk
-from tkinter import ttk
 from typing import Callable, Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QStatusBar,
+    QTableView,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 import ui_service
 from config import AutoDocConfig, get_app_dir
+from sessions_window.sessions_model import (
+    COL_DURATION,
+    COL_NAME,
+    COL_SCREENSHOTS,
+    COL_SEGMENTS,
+    COL_STATUS,
+    SessionsModel,
+)
+from sessions_window.status_delegate import StatusDelegate
 
 log = logging.getLogger(__name__)
 
 # Singleton: re-focus the existing window instead of stacking duplicates.
 _open_window: Optional["SessionsWindow"] = None
+
+# Fixed geometry from the style guide §6. Logical pixels — Qt scales for DPI.
+_MIN_W, _MIN_H = 760, 480
+_DEFAULT_W, _DEFAULT_H = 980, 600
+_ROW_HEIGHT = 28
+
+# Starting column widths. Every column is user-resizable from here (drag the
+# header divider); these are only the initial values. Wide enough for each
+# header's own text so nothing starts out elided.
+_COL_WIDTHS = {
+    COL_NAME: 320,
+    COL_DURATION: 88,
+    COL_SCREENSHOTS: 104,
+    COL_SEGMENTS: 152,
+    COL_STATUS: 128,
+}
 
 
 # ------------------------------------------------------------------ #
@@ -92,7 +132,7 @@ def _load_sessions(config: AutoDocConfig) -> list[dict]:
 
 
 # ------------------------------------------------------------------ #
-# Entry point (must be called on the ui_service UI thread)             #
+# Entry point (must be called on the Qt main thread)                   #
 # ------------------------------------------------------------------ #
 
 def open_sessions_window(
@@ -103,7 +143,7 @@ def open_sessions_window(
     quit_for_update: Optional[Callable[[], None]] = None,
 ) -> None:
     """
-    Open (or re-focus) the Sessions window as a Toplevel of the shared root.
+    Open (or re-focus) the Sessions window.
 
     Args:
         config:        Loaded AutoDocConfig.
@@ -122,193 +162,272 @@ def open_sessions_window(
                        detached updater script (see updater.py).
     """
     global _open_window
-    if _open_window is not None and _open_window.is_alive():
-        _open_window.lift()
+    if _open_window is not None and _open_window.isVisible():
+        _open_window.raise_()
+        _open_window.activateWindow()
         return
 
-    root = ui_service.get_root()
-    win = tk.Toplevel(root)
-    win.title("AutoDoc — Sessions")
-    # Designed at 96 DPI; scaled to the real display (tiny-on-4K fix).
-    win.geometry(ui_service.scaled_geometry(980, 560))
-    win.minsize(ui_service.scale(760), ui_service.scale(420))
-    _open_window = SessionsWindow(win, config, get_model, start_resume, is_idle, quit_for_update)
+    _open_window = SessionsWindow(config, get_model, start_resume, is_idle, quit_for_update)
+    ui_service.set_main_window(_open_window)
+    _open_window.show()
 
 
 # ------------------------------------------------------------------ #
 # Window class                                                         #
 # ------------------------------------------------------------------ #
 
-class SessionsWindow:
+class SessionsWindow(QMainWindow):
     def __init__(
         self,
-        root: tk.Toplevel,
         config: AutoDocConfig,
         get_model: Optional[Callable[[], object]] = None,
         start_resume: Optional[Callable[[Path], None]] = None,
         is_idle: Optional[Callable[[], bool]] = None,
         quit_for_update: Optional[Callable[[], None]] = None,
     ) -> None:
-        self.root = root
+        super().__init__()
         self.config = config
         self._get_model = get_model
         self._start_resume = start_resume
         self._is_idle = is_idle
         self._quit_for_update = quit_for_update
-        self._sessions: list[dict] = []
         self._generating = False
         self._retranscribing = False
+
+        self.setWindowTitle("AutoDoc — Sessions")
+        # setMinimumSize on the WINDOW is sanctioned (§6); the rule against it
+        # applies to inner widgets, where it's used to force layouts instead of
+        # fixing size policies.
+        self.setMinimumSize(_MIN_W, _MIN_H)
+        self.resize(_DEFAULT_W, _DEFAULT_H)
+
         self._build_ui()
         self._refresh()
-
-    def is_alive(self) -> bool:
-        try:
-            return bool(self.root.winfo_exists())
-        except tk.TclError:
-            return False
-
-    def lift(self) -> None:
-        try:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
-        except tk.TclError:
-            pass
+        # Focus the table, not the first toolbar button. Without this, Refresh
+        # (the first focusable widget) takes initial focus and renders its
+        # :focus border, so it looks like a different button variant from "Open
+        # output folder" sitting right next to it — same variant, one just had a
+        # focus ring. The table is also the correct place for focus to start:
+        # it's the primary content, and arrow keys immediately do something
+        # useful.
+        self._table.setFocus()
 
     # ------------------------------------------------------------------ #
     # UI construction                                                      #
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
-        # ── Tabs: Sessions | Settings ────────────────────────────── #
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True)
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.tabBar().setExpanding(False)
+        # False: QTabWidget::pane's border-top is the one seam line. Qt's own
+        # base line is drawn in Fusion's colour rather than a token and gets
+        # interrupted by the selected tab and the corner widget, which is what
+        # made it look like a partially cut-off line. See app.qss.
+        tabs.tabBar().setDrawBase(False)
+        # Refresh / Open output folder live in the tab bar's corner rather than
+        # in their own toolbar row below it. That row cost a full 28px of
+        # button plus a 12px gap — ~40px of stacked chrome above the table for
+        # two rarely-used actions, which is what made the header feel heavy.
+        # A corner widget shares the tab bar's existing 30px band instead, so
+        # the table starts immediately under the tabs.
+        tabs.setCornerWidget(self._build_corner_actions(), Qt.Corner.TopRightCorner)
+        self.setCentralWidget(tabs)
 
-        sessions_tab = tk.Frame(notebook)
-        notebook.add(sessions_tab, text="  Sessions  ")
+        tabs.addTab(self._build_sessions_tab(), "Sessions")
 
         from sessions_window.settings_panel import SettingsPanel
 
-        settings_tab = SettingsPanel(
-            notebook, self.config, is_idle=self._is_idle, quit_for_update=self._quit_for_update
+        tabs.addTab(
+            SettingsPanel(self.config, is_idle=self._is_idle, quit_for_update=self._quit_for_update),
+            "Settings",
         )
-        notebook.add(settings_tab, text="  Settings  ")
 
-        # ── Toolbar ──────────────────────────────────────────────── #
-        toolbar = tk.Frame(sessions_tab, pady=6, padx=8)
-        toolbar.pack(fill="x")
+        status = QStatusBar()
+        self.setStatusBar(status)
+        self._status = status
 
-        tk.Button(toolbar, text="Refresh", width=10, command=self._refresh).pack(
-            side="left", padx=(0, 4)
+    def _build_corner_actions(self) -> QWidget:
+        """Quiet utility actions hosted in the tab bar's top-right corner."""
+        corner = QWidget()
+        # Named so app.qss can paint its background. A bare QWidget in the
+        # tab-bar row paints nothing, and the strip above these buttons then
+        # renders as raw black — see #tabCornerActions in app.qss.
+        corner.setObjectName("tabCornerActions")
+        lay = QHBoxLayout(corner)
+        # 4px top margin matches QTabBar::tab's margin-top in app.qss so these
+        # buttons share the tabs' baseline instead of being clipped against the
+        # top edge of the window's client area.
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(8)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setProperty("variant", "quiet")
+        refresh_btn.clicked.connect(self._refresh)
+        lay.addWidget(refresh_btn)
+
+        output_btn = QPushButton("Open output folder")
+        output_btn.setProperty("variant", "quiet")
+        output_btn.clicked.connect(self._open_output_folder)
+        lay.addWidget(output_btn)
+        return corner
+
+    def _build_sessions_tab(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        # Panel-level margins (12), not window-level (16): this page sits
+        # *inside* the tab pane, which is itself inside the window's chrome, so
+        # 16 here stacked a second full window margin under the tab bar.
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        # ── Table (the ONE stretching child) ─────────────────────── #
+        root.addWidget(self._build_table(), 1)
+
+        # ── Action bar (chrome — stretch 0) ──────────────────────── #
+        root.addLayout(self._build_action_bar())
+
+        return page
+
+    def _build_table(self) -> QWidget:
+        # The container owns the border so the view can be NoFrame — avoids the
+        # doubled/partial outline you get when both draw one (§8, §9).
+        container = QFrame()
+        container.setProperty("panel", "true")
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._model = SessionsModel(self)
+        table = QTableView()
+        table.setModel(self._model)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(False)
+        table.setFrameShape(QFrame.NoFrame)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.ElideRight)
+        # Shrink by eliding + scrolling, never by forcing the window wider (§6).
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.doubleClicked.connect(lambda _idx: self._edit())
+
+        # Status pills.
+        table.setItemDelegateForColumn(
+            self._model.columnCount() - 1, StatusDelegate(table)
         )
-        tk.Button(
-            toolbar, text="Open Output Folder", command=self._open_output_folder
-        ).pack(side="left")
 
-        # ── Session list ─────────────────────────────────────────── #
-        list_frame = tk.Frame(sessions_tab, padx=8)
-        list_frame.pack(fill="both", expand=True)
+        # Fixed 28px rows — the descender rule (§4). Explicit, never implicit:
+        # letting Qt derive row height from font ascent is what clips y/g/p/Q.
+        vh = table.verticalHeader()
+        vh.setVisible(False)
+        vh.setSectionResizeMode(QHeaderView.Fixed)
+        vh.setDefaultSectionSize(_ROW_HEIGHT)
 
-        cols = ("name", "duration", "screenshots", "segments", "status")
-        self.tree = ttk.Treeview(
-            list_frame, columns=cols, show="headings", selectmode="browse"
-        )
-        self.tree.heading("name",        text="Session Name")
-        self.tree.heading("duration",    text="Duration")
-        self.tree.heading("screenshots", text="Screenshots")
-        self.tree.heading("segments",    text="Transcript Segments")
-        self.tree.heading("status",      text="Status")
+        hh = table.horizontalHeader()
+        # Sorting is NOT implemented, so the headers must not look or behave
+        # *clickable* — appearance and behaviour have to match (§9), otherwise
+        # they read as "buttons that do nothing". Resizing is a separate
+        # affordance: Interactive only adds a drag cursor on the divider, which
+        # does correspond to real behaviour, so it doesn't violate that rule.
+        hh.setSectionsClickable(False)
+        hh.setSectionsMovable(False)
+        hh.setHighlightSections(False)
+        for col in range(self._model.columnCount()):
+            hh.setSectionResizeMode(col, QHeaderView.Interactive)
+            hh.resizeSection(col, _COL_WIDTHS.get(col, 100))
+        # Absorb leftover width into the final column so widening the window
+        # can't leave a dead gap to the right of the last header (§6). The
+        # status column is left-aligned pills, so extra room there is invisible
+        # — the same slack in a numeric column would look misaligned.
+        hh.setStretchLastSection(True)
+        hh.setFixedHeight(_ROW_HEIGHT)
 
-        self.tree.column("name",         width=240, anchor="w")
-        self.tree.column("duration",     width=80,  anchor="center")
-        self.tree.column("screenshots",  width=100, anchor="center")
-        self.tree.column("segments",     width=150, anchor="center")
-        self.tree.column("status",       width=110, anchor="center")
+        self._table = table
+        lay.addWidget(table)
+        return container
 
-        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+    def _build_action_bar(self) -> QHBoxLayout:
+        """
+        §6 order, exactly: [destructive] <stretch> [secondary…] [primary]
+        8px between adjacent buttons, 16px before the primary.
+        """
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 16, 0, 0)
+        bar.setSpacing(8)
 
-        # Double-click opens editor
-        self.tree.bind("<Double-1>", lambda e: self._edit())
+        delete_btn = QPushButton("Delete")
+        delete_btn.setProperty("variant", "danger")
+        delete_btn.clicked.connect(self._delete)
+        bar.addWidget(delete_btn)
 
-        # ── Action bar ───────────────────────────────────────────── #
-        action_bar = tk.Frame(sessions_tab, pady=8, padx=8)
-        action_bar.pack(fill="x")
+        bar.addStretch(1)
 
-        self._gen_btn = tk.Button(
-            action_bar,
-            text="Generate Documentation",
-            bg="#2563EB",
-            fg="white",
-            activebackground="#1D4ED8",
-            activeforeground="white",
-            width=24,
-            command=self._generate,
-        )
-        self._gen_btn.pack(side="left", padx=(0, 6))
+        self._edit_btn = QPushButton("Edit session")
+        self._edit_btn.clicked.connect(self._edit)
+        bar.addWidget(self._edit_btn)
 
-        tk.Button(
-            action_bar, text="Edit Session", width=14, command=self._edit
-        ).pack(side="left", padx=(0, 6))
+        self._retrans_btn = QPushButton("Retranscribe")
+        self._retrans_btn.clicked.connect(self._retranscribe)
+        bar.addWidget(self._retrans_btn)
 
-        self._retrans_btn = tk.Button(
-            action_bar, text="Retranscribe", width=14, command=self._retranscribe
-        )
-        self._retrans_btn.pack(side="left", padx=(0, 6))
+        record_more_btn = QPushButton("Record more")
+        record_more_btn.clicked.connect(self._record_more)
+        bar.addWidget(record_more_btn)
 
-        tk.Button(
-            action_bar, text="Record More", width=13, command=self._record_more
-        ).pack(side="left", padx=(0, 6))
+        export_btn = QPushButton("Export")
+        export_btn.clicked.connect(self._export)
+        bar.addWidget(export_btn)
 
-        tk.Button(
-            action_bar, text="Export", width=16, command=self._export
-        ).pack(side="left", padx=(0, 6))
+        bar.addSpacing(16)
 
-        tk.Button(
-            action_bar, text="Delete", fg="#DC2626", width=10, command=self._delete
-        ).pack(side="right")
-
-        # Status bar
-        self._status_var = tk.StringVar(value="")
-        tk.Label(
-            self.root,
-            textvariable=self._status_var,
-            anchor="w",
-            fg="#6B7280",
-            font=("TkDefaultFont", 8),
-        ).pack(fill="x", padx=8, pady=(0, 4))
+        self._gen_btn = QPushButton("Generate documentation")
+        self._gen_btn.setProperty("variant", "primary")
+        self._gen_btn.clicked.connect(self._generate)
+        bar.addWidget(self._gen_btn)
+        return bar
 
     # ------------------------------------------------------------------ #
     # Data helpers                                                         #
     # ------------------------------------------------------------------ #
 
+    def _set_status(self, text: str) -> None:
+        self._status.showMessage(text)
+
+    def _confirm(self, title: str, text: str) -> bool:
+        """
+        Yes/No confirmation. Returns True only on an explicit Yes.
+
+        Wrapped in one place, and fully explicit about both the button set and
+        the compared enum member, rather than relying on QMessageBox.question's
+        default buttons or on PySide6's forgiving `QMessageBox.Yes` shorthand.
+        Destructive actions (Delete, Retranscribe, Record more) route through
+        here, so an enum/API change can't silently start returning a truthy
+        value and skipping the prompt.
+        """
+        answer = QMessageBox.question(
+            self,
+            title,
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _refresh(self) -> None:
-        self._sessions = _load_sessions(self.config)
-        self.tree.delete(*self.tree.get_children())
-        for s in self._sessions:
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    s["name"],
-                    s["duration"] or "—",
-                    s["screenshot_count"],
-                    s["segment_count"],
-                    s["status"],
-                ),
-            )
-        count = len(self._sessions)
-        self._status_var.set(f"{count} session{'s' if count != 1 else ''} found.")
+        sessions = _load_sessions(self.config)
+        self._model.set_sessions(sessions)
+        count = len(sessions)
+        self._set_status(f"{count} session{'s' if count != 1 else ''} found.")
 
     def _selected_session(self) -> Optional[dict]:
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showinfo("AutoDoc", "Please select a session first.", parent=self.root)
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "AutoDoc", "Please select a session first.")
             return None
-        idx = self.tree.index(selection[0])
-        return self._sessions[idx]
+        return self._model.session_at(rows[0].row())
 
     # ------------------------------------------------------------------ #
     # Actions                                                              #
@@ -324,21 +443,20 @@ class SessionsWindow:
             with open(json_path, encoding="utf-8") as f:
                 session_data = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            messagebox.showerror("AutoDoc", f"Could not open session:\n{exc}", parent=self.root)
+            QMessageBox.critical(self, "AutoDoc", f"Could not open session:\n{exc}")
             return
 
         from sessions_window.session_editor import open_editor_window
 
-        # Already on the UI thread — open the editor Toplevel directly.
+        # Already on the Qt main thread — open directly.
         open_editor_window(
             session_data, session["session_dir"], self.config, self._generate_from_editor
         )
 
     def _generate_from_editor(self, session_data: dict, session_dir: Path) -> None:
         """Called by the editor when the user clicks Generate inside it."""
-        # Reload the session list so counts reflect any deleted screenshots.
+        # Reload the list so counts reflect any deleted screenshots.
         self._refresh()
-        # Run generation on the data as saved by the editor.
         self._run_generation(
             {
                 "session_id": session_data.get("session_id", session_dir.name),
@@ -349,7 +467,7 @@ class SessionsWindow:
 
     def _generate(self) -> None:
         if self._generating:
-            messagebox.showinfo("AutoDoc", "A generation is already in progress.", parent=self.root)
+            QMessageBox.information(self, "AutoDoc", "A generation is already in progress.")
             return
         session = self._selected_session()
         if not session:
@@ -358,13 +476,13 @@ class SessionsWindow:
 
     def _run_generation(self, session: dict) -> None:
         # No wait-cursor: generation runs in a worker thread and the rest of
-        # the app stays usable. A "wait" cursor over the whole window told
-        # users the opposite. (Note: with a LOCAL model on this same machine,
+        # the app stays usable. (Note: with a LOCAL model on this same machine,
         # inference can peg every CPU core — the app may still feel sluggish,
         # but that's the model server's load, not blocking in here.)
         self._generating = True
-        self._gen_btn.config(state="disabled", text="Generating…")
-        self._status_var.set(
+        self._gen_btn.setEnabled(False)
+        self._gen_btn.setText("Generating…")
+        self._set_status(
             f"Generating documentation for '{session['name']}' in the background — "
             f"you can keep using AutoDoc."
         )
@@ -404,28 +522,27 @@ class SessionsWindow:
             msg = str(exc)
             ui_service.call_soon(lambda: self._on_generate_error(msg))
 
-    def _on_generated(self, output_path: Path) -> None:
+    def _reset_gen_button(self) -> None:
         self._generating = False
-        self._gen_btn.config(state="normal", text="Generate Documentation")
-        self._status_var.set(f"Saved: {output_path.name}")
-        if messagebox.askyesno(
+        self._gen_btn.setEnabled(True)
+        self._gen_btn.setText("Generate documentation")
+
+    def _on_generated(self, output_path: Path) -> None:
+        self._reset_gen_button()
+        self._set_status(f"Saved: {output_path.name}")
+        if self._confirm(
             "AutoDoc — Done",
             f"Documentation saved to:\n{output_path}\n\nOpen the file now?",
-            parent=self.root,
         ):
-            if sys.platform == "win32":
-                subprocess.Popen(["explorer", "/select,", str(output_path)])
-            else:
-                subprocess.Popen(["open", str(output_path)])
+            self._reveal(output_path)
 
     def _on_generate_error(self, error: str) -> None:
-        self._generating = False
-        self._gen_btn.config(state="normal", text="Generate Documentation")
-        self._status_var.set("Generation failed.")
-        messagebox.showerror(
-            "AutoDoc — Generation Failed",
+        self._reset_gen_button()
+        self._set_status("Generation failed.")
+        QMessageBox.critical(
+            self,
+            "AutoDoc — Generation failed",
             f"Could not generate documentation.\n\nError:\n{error}",
-            parent=self.root,
         )
 
     # ------------------------------------------------------------------ #
@@ -437,7 +554,7 @@ class SessionsWindow:
         sessions stuck without a transcript (status 'transcript_failed' or a
         pre-fix 'recording'), but allowed on any session with audio."""
         if self._retranscribing:
-            messagebox.showinfo("AutoDoc", "A retranscription is already in progress.", parent=self.root)
+            QMessageBox.information(self, "AutoDoc", "A retranscription is already in progress.")
             return
         session = self._selected_session()
         if not session:
@@ -445,38 +562,38 @@ class SessionsWindow:
 
         wav_path = session["session_dir"] / "audio_full.wav"
         if not wav_path.exists():
-            messagebox.showerror(
+            QMessageBox.critical(
+                self,
                 "AutoDoc",
                 "This session has no saved audio file (audio_full.wav), so it "
                 "cannot be retranscribed.",
-                parent=self.root,
             )
             return
 
         model = self._get_model() if self._get_model else None
         if model is None:
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "AutoDoc",
                 "The speech model is still loading (or failed to load).\n"
                 "Check autodoc.log if this persists, then try again.",
-                parent=self.root,
             )
             return
 
         warning = "This will REPLACE the session's transcript segments."
         if session["segment_count"] == 0:
             warning = "This session currently has no transcript."
-        if not messagebox.askyesno(
+        if not self._confirm(
             "AutoDoc — Retranscribe",
             f"{warning}\n\nAny manual transcript edits will also be cleared.\n"
             f"Retranscribe '{session['name']}' now?",
-            parent=self.root,
         ):
             return
 
         self._retranscribing = True
-        self._retrans_btn.config(state="disabled", text="Transcribing…")
-        self._status_var.set(f"Retranscribing '{session['name']}'…")
+        self._retrans_btn.setEnabled(False)
+        self._retrans_btn.setText("Transcribing…")
+        self._set_status(f"Retranscribing '{session['name']}'…")
 
         threading.Thread(
             target=self._do_retranscribe,
@@ -523,20 +640,23 @@ class SessionsWindow:
             msg = str(exc)
             ui_service.call_soon(lambda: self._on_retranscribe_error(msg))
 
-    def _on_retranscribed(self, name: str, segment_count: int) -> None:
+    def _reset_retrans_button(self) -> None:
         self._retranscribing = False
-        self._retrans_btn.config(state="normal", text="Retranscribe")
+        self._retrans_btn.setEnabled(True)
+        self._retrans_btn.setText("Retranscribe")
+
+    def _on_retranscribed(self, name: str, segment_count: int) -> None:
+        self._reset_retrans_button()
         self._refresh()
-        self._status_var.set(f"Retranscribed '{name}': {segment_count} segments.")
+        self._set_status(f"Retranscribed '{name}': {segment_count} segments.")
 
     def _on_retranscribe_error(self, error: str) -> None:
-        self._retranscribing = False
-        self._retrans_btn.config(state="normal", text="Retranscribe")
-        self._status_var.set("Retranscription failed.")
-        messagebox.showerror(
-            "AutoDoc — Retranscribe Failed",
+        self._reset_retrans_button()
+        self._set_status("Retranscription failed.")
+        QMessageBox.critical(
+            self,
+            "AutoDoc — Retranscribe failed",
             f"Could not retranscribe this session.\n\nError:\n{error}",
-            parent=self.root,
         )
 
     # ------------------------------------------------------------------ #
@@ -549,39 +669,32 @@ class SessionsWindow:
         if not session:
             return
         if self._start_resume is None:
-            messagebox.showinfo(
-                "AutoDoc",
-                "Recording can only be started from the main AutoDoc app.",
-                parent=self.root,
+            QMessageBox.information(
+                self, "AutoDoc", "Recording can only be started from the main AutoDoc app."
             )
             return
         if session["status"] == "recording":
-            messagebox.showerror(
-                "AutoDoc",
-                "This session appears to be recording already.",
-                parent=self.root,
+            QMessageBox.critical(
+                self, "AutoDoc", "This session appears to be recording already."
             )
             return
         if not (session["session_dir"] / "audio_full.wav").exists():
-            messagebox.showerror(
-                "AutoDoc",
-                "This session has no saved audio file, so it cannot be resumed.",
-                parent=self.root,
+            QMessageBox.critical(
+                self, "AutoDoc", "This session has no saved audio file, so it cannot be resumed."
             )
             return
-        if not messagebox.askyesno(
-            "AutoDoc — Record More",
+        if not self._confirm(
+            "AutoDoc — Record more",
             f"Continue recording into '{session['name']}'?\n\n"
             "New clicks and narration will be added to this session. When you "
             "stop, the transcript is REBUILT from the full audio — any manual "
             "transcript edits will be cleared. Screenshots and their redaction "
             "settings are kept.",
-            parent=self.root,
         ):
             return
 
         self._start_resume(session["session_dir"])
-        self._status_var.set(
+        self._set_status(
             f"Recording more into '{session['name']}' — stop from the tray icon, then Refresh."
         )
 
@@ -600,7 +713,7 @@ class SessionsWindow:
             with open(json_path, encoding="utf-8") as f:
                 session_data = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            messagebox.showerror("AutoDoc", f"Could not read session:\n{exc}", parent=self.root)
+            QMessageBox.critical(self, "AutoDoc", f"Could not read session:\n{exc}")
             return
 
         from generation.exporter import export_session, zip_export_folder
@@ -613,30 +726,24 @@ class SessionsWindow:
             zip_path = zip_export_folder(export_dir)
         except Exception as exc:
             log.exception("_export: failed")
-            messagebox.showerror("AutoDoc — Export Failed", f"Export error:\n{exc}", parent=self.root)
+            QMessageBox.critical(self, "AutoDoc — Export failed", f"Export error:\n{exc}")
             return
 
-        self._status_var.set(f"Exported: {zip_path.name}")
+        self._set_status(f"Exported: {zip_path.name}")
 
-        if messagebox.askyesno(
+        if self._confirm(
             "AutoDoc — Exported",
-            f"Session exported to:\n{zip_path}\n\n"
-            f"Open the folder containing the zip now?",
-            parent=self.root,
+            f"Session exported to:\n{zip_path}\n\nOpen the folder containing the zip now?",
         ):
-            if sys.platform == "win32":
-                subprocess.Popen(["explorer", "/select,", str(zip_path)])
-            else:
-                subprocess.Popen(["open", str(zip_path.parent)])
+            self._reveal(zip_path)
 
     def _delete(self) -> None:
         session = self._selected_session()
         if not session:
             return
-        if not messagebox.askyesno(
+        if not self._confirm(
             "AutoDoc",
             f"Permanently delete '{session['name']}'?\n\nThis cannot be undone.",
-            parent=self.root,
         ):
             return
         shutil.rmtree(session["session_dir"], ignore_errors=True)
@@ -649,3 +756,27 @@ class SessionsWindow:
             subprocess.Popen(["explorer", str(output_dir)])
         else:
             subprocess.Popen(["open", str(output_dir)])
+
+    @staticmethod
+    def _reveal(path: Path) -> None:
+        """Show a file in the OS file manager, selected."""
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        else:
+            subprocess.Popen(["open", str(path.parent)])
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                            #
+    # ------------------------------------------------------------------ #
+
+    def closeEvent(self, event) -> None:
+        """
+        Clear the module singleton and the ui_service main-window pointer so a
+        later "View sessions" builds a fresh window instead of trying to
+        raise() a deleted one, and so dialogs don't parent to a dead widget.
+        """
+        global _open_window
+        _open_window = None
+        if ui_service.get_main_window() is self:
+            ui_service.set_main_window(None)
+        super().closeEvent(event)

@@ -2,15 +2,22 @@
 tray/tray_app.py — System tray icon and application state machine.
 
 States:
-    IDLE        → user can Start Recording or open View Sessions
-    RECORDING   → user can Stop Recording
+    IDLE         → user can Start Recording or open View Sessions
+    RECORDING    → user can Stop Recording / Pause
     TRANSCRIBING → locked; Whisper is running in a worker thread
-    (Sessions window is a separate, non-blocking tkinter window)
 
-pystray runs on the main thread (required by the Win32 backend). The Sessions
-window is opened in a separate thread with its own Tk() root — this is not
-officially supported by tkinter but works reliably in practice on Windows for
-simple windows.
+THREADING (changed 2026-07-24, Qt port):
+Previously pystray owned the process main thread (its Win32 backend requires
+that) and tkinter ran a second event loop on its own thread — two message
+pumps, and the reason ui_service.py existed in its original form. Now
+QSystemTrayIcon is just another Qt widget: the tray, every window, and every
+dialog all live on the single Qt main thread, and there is exactly one event
+loop. pystray is gone as a dependency.
+
+Worker threads (recording, transcription, generation, the pynput hotkey
+listener) still never touch UI objects directly — they hand callables to
+ui_service.call_soon(). That constraint did not relax; only its enforcement
+mechanism changed. See ui_service.py.
 
 The Whisper model is pre-loaded in a background thread at startup so there is
 no delay when the user first stops a recording.
@@ -21,14 +28,12 @@ import logging
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import simpledialog
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import pystray
-from PIL import Image as PILImage
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import QInputDialog, QMenu, QSystemTrayIcon
 
 import ui_service
 from config import AutoDocConfig, get_app_dir
@@ -46,21 +51,23 @@ log = logging.getLogger(__name__)
 # Icon helpers                                                         #
 # ------------------------------------------------------------------ #
 
-_ICON_COLORS = {
-    "idle": (70, 130, 180),       # steel blue
-    "recording": (220, 50, 47),   # red
-    "processing": (255, 165, 0),  # orange
-}
+def _make_icon(name: str) -> QIcon:
+    """
+    Tray icon for a state, from assets/icon_<name>.(svg|png).
 
-
-def _make_icon(name: str) -> PILImage.Image:
-    """Load icon PNG from assets/ or fall back to a colored 64×64 square."""
-    path = get_app_dir() / "assets" / f"icon_{name}.png"
-    if path.exists():
-        return PILImage.open(path).convert("RGBA")
-    color = _ICON_COLORS.get(name, (128, 128, 128))
-    img = PILImage.new("RGBA", (64, 64), (*color, 255))
-    return img
+    SVG is preferred (crisp at every tray DPI — the style guide's §7 rule
+    against runtime-scaled rasters applies here too); .png is accepted as a
+    fallback so the existing assets keep working. If neither exists Qt gets a
+    null QIcon, which shows nothing in the tray — hence the warning, because
+    "my tray icon is invisible" is otherwise a mystery.
+    """
+    assets = get_app_dir() / "assets"
+    for ext in ("svg", "png"):
+        path = assets / f"icon_{name}.{ext}"
+        if path.exists():
+            return QIcon(str(path))
+    log.warning("_make_icon: no assets/icon_%s.{svg,png} found — tray icon will be blank", name)
+    return QIcon()
 
 
 # ------------------------------------------------------------------ #
@@ -75,34 +82,33 @@ class TrayApp:
         self._whisper_ready = threading.Event()
         self._state = "IDLE"
         self._recording_mode: str = "full"   # "full" | "transcript_only"
-        self._icon: Optional[pystray.Icon] = None
+        self._tray: Optional[QSystemTrayIcon] = None
+        self._menu: Optional[QMenu] = None
         self._state_lock = threading.Lock()
         self._hotkeys = None  # pynput GlobalHotKeys, active only while recording
+        self._sessions_window = None
 
     # ------------------------------------------------------------------ #
     # Public entry point                                                   #
     # ------------------------------------------------------------------ #
 
-    def run(self) -> None:
-        """Build the tray icon and block the main thread on pystray's loop."""
-        # Single shared Tk root/UI thread — ALL windows and dialogs in the app
-        # run through this. See ui_service.py for why this is non-negotiable.
-        ui_service.start()
+    def start(self) -> None:
+        """
+        Create the tray icon and menu. Returns immediately — unlike pystray's
+        blocking icon.run(), the event loop is QApplication.exec() in main().
+        """
+        self._tray = QSystemTrayIcon(_make_icon("idle"))
+        self._menu = QMenu()
+        self._tray.setContextMenu(self._menu)
+        self._apply_state("IDLE")
+        self._tray.show()
 
-        # Kick off Whisper pre-load so it's ready before the first recording ends.
-        # Named so it's identifiable in the all-threads stack dump that
+        # Kick off Whisper pre-load so it's ready before the first recording
+        # ends. Named so it's identifiable in the all-threads stack dump that
         # _transcribe_and_finalize() logs if this preload never finishes.
         threading.Thread(
             target=self._preload_whisper, name="whisper-preload", daemon=True
         ).start()
-
-        self._icon = pystray.Icon(
-            "AutoDoc",
-            _make_icon("idle"),
-            "AutoDoc — Idle",
-            menu=self._build_menu(),
-        )
-        self._icon.run()  # Blocks on main thread (required by Win32 backend).
 
     # ------------------------------------------------------------------ #
     # Menu construction                                                    #
@@ -117,68 +123,100 @@ class TrayApp:
         pretty = "+".join(p.strip("<>").capitalize() for p in combo.split("+"))
         return f" ({pretty})"
 
-    def _build_menu(self) -> pystray.Menu:
+    def _rebuild_menu(self) -> None:
+        """
+        Repopulate the tray menu for the current state.
+
+        QMenu is rebuilt in place (clear() + re-add) rather than swapped for a
+        new object: QSystemTrayIcon.setContextMenu does not take ownership, so
+        replacing the menu each time would leave the old QMenu to be garbage
+        collected while Windows may still reference it. Keeping one QMenu for
+        the tray's lifetime avoids that class of crash entirely.
+        """
+        menu = self._menu
+        if menu is None:
+            return
+        menu.clear()
+
         state = self._state
         if state == "IDLE":
-            return pystray.Menu(
-                pystray.MenuItem("Start Recording", self._start_recording),
-                pystray.MenuItem("Start Transcription Only", self._start_transcript_only),
-                pystray.MenuItem("View Sessions", self._open_sessions_window),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Quit", self._quit),
-            )
+            self._add_action(menu, "Start recording", self._start_recording)
+            self._add_action(menu, "Start transcription only", self._start_transcript_only)
+            self._add_action(menu, "View sessions", self._open_sessions_window)
+            menu.addSeparator()
+            self._add_action(menu, "Quit", self.quit)
+            return
+
         if state == "RECORDING":
             mode_label = (
-                "Stop Transcription" if self._recording_mode == "transcript_only"
-                else "Stop Recording"
+                "Stop transcription" if self._recording_mode == "transcript_only"
+                else "Stop recording"
             ) + self._pretty_hotkey(self.config.stop_hotkey)
             paused = bool(self._session and self._session.is_paused)
             pause_label = (
-                "Resume Capture" if paused else "Pause Capture"
+                "Resume capture" if paused else "Pause capture"
             ) + self._pretty_hotkey(self.config.pause_hotkey)
-            return pystray.Menu(
-                pystray.MenuItem(mode_label, self._stop_recording),
-                pystray.MenuItem(pause_label, self._toggle_pause),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Quit", self._quit),
-            )
+            self._add_action(menu, mode_label, self._stop_recording)
+            self._add_action(menu, pause_label, self._toggle_pause)
+            menu.addSeparator()
+            self._add_action(menu, "Quit", self.quit)
+            return
+
         # TRANSCRIBING
-        return pystray.Menu(
-            pystray.MenuItem("Processing… please wait", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self._quit),
-        )
+        busy = self._add_action(menu, "Processing… please wait", None)
+        busy.setEnabled(False)
+        menu.addSeparator()
+        self._add_action(menu, "Quit", self.quit)
+
+    def _add_action(self, menu: QMenu, label: str, slot) -> QAction:
+        action = QAction(label, menu)
+        if slot is not None:
+            action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
 
     def _apply_state(self, state: str) -> None:
-        """Update internal state, tray icon image, tooltip, and menu."""
+        """
+        Update internal state, tray icon, tooltip, and menu.
+
+        Callable from worker threads (the transcription thread and the pynput
+        hotkey thread both do), so all Qt work is marshalled to the main
+        thread via ui_service.call_soon. The plain attribute assignment stays
+        here so is_idle()/_state checks see the new value immediately rather
+        than after a trip through the event loop.
+        """
         self._state = state
-        if self._icon is None:
-            return
-        icon_name = {"IDLE": "idle", "RECORDING": "recording", "TRANSCRIBING": "processing"}.get(
-            state, "idle"
-        )
-        if state == "RECORDING" and self._session and self._session.is_paused:
-            tooltip = "AutoDoc — Paused"
-        elif state == "RECORDING" and self._recording_mode == "transcript_only":
-            tooltip = "AutoDoc — Transcription Only…"
-        else:
-            tooltip = {
-                "IDLE": "AutoDoc — Idle",
-                "RECORDING": "AutoDoc — Recording…",
-                "TRANSCRIBING": "AutoDoc — Transcribing…",
-            }.get(state, "AutoDoc")
-        self._icon.icon = _make_icon(icon_name)
-        self._icon.title = tooltip
-        self._icon.menu = self._build_menu()
+
+        def _apply() -> None:
+            if self._tray is None:
+                return
+            icon_name = {
+                "IDLE": "idle", "RECORDING": "recording", "TRANSCRIBING": "processing",
+            }.get(state, "idle")
+            if state == "RECORDING" and self._session and self._session.is_paused:
+                tooltip = "AutoDoc — Paused"
+            elif state == "RECORDING" and self._recording_mode == "transcript_only":
+                tooltip = "AutoDoc — Transcription only…"
+            else:
+                tooltip = {
+                    "IDLE": "AutoDoc — Idle",
+                    "RECORDING": "AutoDoc — Recording…",
+                    "TRANSCRIBING": "AutoDoc — Transcribing…",
+                }.get(state, "AutoDoc")
+            self._tray.setIcon(_make_icon(icon_name))
+            self._tray.setToolTip(tooltip)
+            self._rebuild_menu()
+
+        ui_service.call_soon(_apply)
 
     # ------------------------------------------------------------------ #
     # Menu actions                                                         #
     # ------------------------------------------------------------------ #
 
-    def _start_recording(self, icon=None, item=None) -> None:
+    def _start_recording(self) -> None:
         self._begin_session(mode="full")
 
-    def _start_transcript_only(self, icon=None, item=None) -> None:
+    def _start_transcript_only(self) -> None:
         self._begin_session(mode="transcript_only")
 
     def _begin_session(self, mode: str) -> None:
@@ -206,7 +244,7 @@ class TrayApp:
     # Pause / manual-capture hotkey (PRD F4)                               #
     # ------------------------------------------------------------------ #
 
-    def _toggle_pause(self, icon=None, item=None) -> None:
+    def _toggle_pause(self) -> None:
         session = self._session
         if not session or self._state != "RECORDING":
             return
@@ -277,8 +315,9 @@ class TrayApp:
             session.manual_capture()
 
     def _on_hotkey_pause(self) -> None:
-        # Same path as the tray menu item; safe from the pynput thread for
-        # the same reason _apply_state is already called from worker threads.
+        # Runs on the pynput listener thread. _toggle_pause only touches
+        # Session (thread-safe by design) and _apply_state, which marshals its
+        # own Qt work — so this is safe without extra wrapping.
         self._toggle_pause()
 
     def _on_hotkey_stop(self) -> None:
@@ -287,7 +326,7 @@ class TrayApp:
         log.info("stop hotkey pressed")
         self._stop_recording()
 
-    def _stop_recording(self, icon=None, item=None) -> None:
+    def _stop_recording(self) -> None:
         with self._state_lock:
             if self._state != "RECORDING":
                 return
@@ -303,7 +342,7 @@ class TrayApp:
             daemon=True,
         ).start()
 
-        # Naming dialog runs in parallel on the UI thread — user can name
+        # Naming dialog runs in parallel on the main thread — user can name
         # while Whisper works. Resumed sessions already have a name (PRD F5),
         # so don't nag for a new one.
         if session and not session.name:
@@ -318,7 +357,7 @@ class TrayApp:
     def resume_recording(self, session_dir) -> None:
         """
         Record More (PRD F5): append a new recording pass onto an existing
-        session. Called from the Sessions window on the UI thread; only
+        session. Called from the Sessions window on the main thread; only
         TrayApp may start recordings because it owns the state machine.
         """
         session_dir = Path(session_dir)
@@ -347,7 +386,7 @@ class TrayApp:
         self._start_hotkey_listener()
         self._notify("Recording more into this session — stop from the tray icon when done.")
 
-    def _open_sessions_window(self, icon=None, item=None) -> None:
+    def _open_sessions_window(self) -> None:
         from sessions_window.sessions_window import open_sessions_window
 
         ui_service.call_soon(
@@ -372,12 +411,17 @@ class TrayApp:
         self._stop_hotkey_listener()
         if self._state == "RECORDING" and self._session:
             self._session.stop()
-        ui_service.stop()
-        if self._icon:
-            self._icon.stop()
 
-    def _quit(self, icon=None, item=None) -> None:
-        self.quit()
+        def _teardown() -> None:
+            from PySide6.QtWidgets import QApplication
+
+            if self._tray is not None:
+                # Hide before quitting or Windows can leave a phantom icon in
+                # the notification area until the user hovers over it.
+                self._tray.hide()
+            QApplication.instance().quit()
+
+        ui_service.call_soon(_teardown)
 
     # ------------------------------------------------------------------ #
     # Transcription pipeline                                               #
@@ -387,29 +431,24 @@ class TrayApp:
         """
         Show a simple naming dialog while transcription runs in the background.
         The name is saved to session.json as soon as the user confirms.
-        MUST run on the ui_service UI thread (scheduled via call_soon) — it
-        used to spin up its own Tk() root in its own thread, which is one of
-        the multi-interpreter patterns that hard-crashed the whole process.
-        The dialog is modal on the UI thread, which is fine: it's brief, and
-        no other window needs interaction while it's up.
+        MUST run on the Qt main thread (scheduled via call_soon) — under the
+        old tkinter stack this used to spin up its own Tk() root on its own
+        thread, which hard-crashed the process; the Qt equivalent of that
+        mistake corrupts paint state instead of crashing outright, which is
+        worse to diagnose.
+
+        Parent is the Sessions window if it happens to be open, else None.
+        A modal dialog here is fine: it's brief, and no other window needs
+        interaction while it's up.
         """
-        shared_root = ui_service.get_root()
-        # Transient topmost parent so the dialog appears above other windows
-        # even though the shared root itself is hidden.
-        parent = tk.Toplevel(shared_root)
-        parent.withdraw()
-        parent.attributes("-topmost", True)
-        try:
-            name = simpledialog.askstring(
-                "Name Your Recording",
-                "What workflow did you just record?\n\n"
-                "Give it a short, descriptive name\n"
-                "(e.g. 'How to submit a grade change'):",
-                parent=parent,
-            )
-        finally:
-            parent.destroy()
-        if name and name.strip():
+        name, ok = QInputDialog.getText(
+            ui_service.get_main_window(),
+            "Name your recording",
+            "What workflow did you just record?\n\n"
+            "Give it a short, descriptive name\n"
+            "(e.g. 'How to submit a grade change'):",
+        )
+        if ok and name and name.strip():
             session.set_name(name.strip())
 
     def _preload_whisper(self) -> None:
@@ -519,20 +558,28 @@ class TrayApp:
         session.finalize(stopped_at, transcript_ok=transcript_ok)
         self._apply_state("IDLE")
         if transcript_ok:
-            self._notify("Session saved! Open 'View Sessions' to generate documentation.")
+            self._notify("Session saved! Open 'View sessions' to generate documentation.")
 
     # ------------------------------------------------------------------ #
     # Notifications                                                        #
     # ------------------------------------------------------------------ #
 
     def _notify(self, message: str) -> None:
+        """
+        Tray balloon notification. Safe to call from any thread — the Qt call
+        is marshalled to the main thread.
+        """
         log.info("_notify: %s", message.replace("\n", " | "))
-        if self._icon:
+
+        def _show() -> None:
+            if self._tray is None:
+                return
             try:
-                self._icon.notify(message, "AutoDoc")
+                self._tray.showMessage("AutoDoc", message, _make_icon("idle"))
             except Exception:
-                # Windows toast notifications are notoriously unreliable for
+                # Windows toast/balloon delivery is unreliable for
                 # unsigned/portable exes and can silently no-op. The log line
-                # above is the one guaranteed place this message actually
-                # shows up.
-                log.exception("_notify: icon.notify() raised (message above may not have been seen)")
+                # above is the one guaranteed place this message shows up.
+                log.exception("_notify: showMessage raised (message above may not have been seen)")
+
+        ui_service.call_soon(_show)
