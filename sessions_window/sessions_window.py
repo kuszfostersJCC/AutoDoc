@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -381,6 +382,14 @@ class SessionsWindow(QMainWindow):
         export_btn.clicked.connect(self._export)
         bar.addWidget(export_btn)
 
+        # Retry a failed push without paying for generation again. Lives here
+        # rather than in the editor because it operates on the selected session
+        # like every other button on this bar, and it needs no session content —
+        # generation/run.py cached the prepared markdown for exactly this.
+        self._publish_btn = QPushButton("Publish to BookStack")
+        self._publish_btn.clicked.connect(self._publish)
+        bar.addWidget(self._publish_btn)
+
         bar.addSpacing(16)
 
         self._gen_btn = QPushButton("Generate documentation")
@@ -457,10 +466,17 @@ class SessionsWindow(QMainWindow):
         """Called by the editor when the user clicks Generate inside it."""
         # Reload the list so counts reflect any deleted screenshots.
         self._refresh()
+        # The guard belongs here too, not just in _generate(): this used to be
+        # the one path into _run_generation that skipped it, so Generate from an
+        # editor could start a second concurrent run and leave _gen_btn's state
+        # owned by whichever finished last.
+        if self._generating:
+            QMessageBox.information(self, "AutoDoc", "A generation is already in progress.")
+            return
         self._run_generation(
             {
                 "session_id": session_data.get("session_id", session_dir.name),
-                "name": session_data.get("name"),
+                "name": session_data.get("name") or session_dir.name,
                 "session_dir": session_dir,
             }
         )
@@ -497,42 +513,142 @@ class SessionsWindow(QMainWindow):
     def _do_generate(self, session: dict) -> None:
         """Worker thread. Reports back via ui_service.call_soon ONLY."""
         try:
-            from generation.generator import generate_documentation
-            from generation.renderers import write_outputs
+            from generation.run import run_generation
 
-            session_dir: Path = session["session_dir"]
-            with open(session_dir / "session.json", encoding="utf-8") as f:
-                data = json.load(f)
-
-            markdown = generate_documentation(
+            result = run_generation(
                 config=self.config,
-                session_data=data,
-                session_dir=session_dir,
+                session_dir=session["session_dir"],
             )
-            paths = write_outputs(
-                markdown=markdown,
-                session_data=data,
-                session_dir=session_dir,
-                config=self.config,
-                output_dir=get_app_dir() / self.config.output_dir,
-            )
-            ui_service.call_soon(lambda: self._on_generated(paths[0]))
+            primary = result.paths[0]
+            publish = result.publish
+            ui_service.call_soon(lambda: self._on_generated(primary, publish))
         except Exception as exc:
             log.exception("_do_generate: generation failed")
             msg = str(exc)
             ui_service.call_soon(lambda: self._on_generate_error(msg))
+
+    # ------------------------------------------------------------------ #
+    # BookStack publish / retry                                            #
+    # ------------------------------------------------------------------ #
+
+    def _publish(self) -> None:
+        """
+        Push an already-generated session to BookStack (or retry a failed push).
+
+        Deliberately works even when bookstack_enabled is off — an explicit
+        button press is its own consent, and requiring a settings change first
+        would make "publish just this one" impossible.
+        """
+        session = self._selected_session()
+        if not session:
+            return
+        if not self.config.bookstack_enabled:
+            if not self._confirm(
+                "AutoDoc — Publish",
+                "Automatic BookStack publishing is turned off in Settings.\n\n"
+                "Publish this session anyway?",
+            ):
+                return
+
+        self._publish_btn.setEnabled(False)
+        self._publish_btn.setText("Publishing…")
+        self._set_status(f"Publishing '{session['name']}' to BookStack…")
+
+        session_dir: Path = session["session_dir"]
+        # Force the publish regardless of the config flag: the user asked for it
+        # explicitly. Copy the config so the on-disk setting is untouched.
+        cfg = replace(self.config, bookstack_enabled=True)
+
+        def _work() -> None:
+            """Worker thread. Reports back via ui_service.call_soon ONLY."""
+            try:
+                from generation.run import publish_existing
+
+                result = publish_existing(config=cfg, session_dir=session_dir)
+                ui_service.call_soon(lambda: self._on_published(result))
+            except Exception as exc:
+                log.exception("_publish: publish failed")
+                msg = str(exc)
+                ui_service.call_soon(lambda: self._on_published_error(msg))
+
+        threading.Thread(target=_work, name="bookstack-publish", daemon=True).start()
+
+    def _reset_publish_button(self) -> None:
+        self._publish_btn.setEnabled(True)
+        self._publish_btn.setText("Publish to BookStack")
+
+    def _on_published(self, result) -> None:
+        self._reset_publish_button()
+        if result.skipped:
+            self._set_status(f"Not published — {result.reason}")
+            QMessageBox.information(
+                self, "AutoDoc", f"Nothing was published:\n\n{result.reason}"
+            )
+            return
+        if not result.ok:
+            self._set_status("Publish failed.")
+            QMessageBox.critical(
+                self,
+                "AutoDoc — BookStack",
+                f"Could not publish to BookStack:\n\n{result.reason}",
+            )
+            return
+        self._set_status(f"Published: {result.page_url}")
+        QMessageBox.information(
+            self,
+            "AutoDoc — BookStack",
+            f"Published {result.uploaded} screenshot(s) to:\n{result.page_url}\n\n"
+            "The page is tagged Status: draft until someone reviews it.",
+        )
+
+    def _on_published_error(self, error: str) -> None:
+        self._reset_publish_button()
+        self._set_status("Publish failed.")
+        QMessageBox.critical(
+            self, "AutoDoc — BookStack", f"Could not publish to BookStack:\n\n{error}"
+        )
 
     def _reset_gen_button(self) -> None:
         self._generating = False
         self._gen_btn.setEnabled(True)
         self._gen_btn.setText("Generate documentation")
 
-    def _on_generated(self, output_path: Path) -> None:
+    def _on_generated(self, output_path: Path, publish=None) -> None:
+        """
+        Report a finished generation, INCLUDING the automatic publish outcome.
+
+        Reporting publish here is not cosmetic. It was originally omitted, and the
+        result was that an automatic publish could fail on every generation while
+        the app said only "Saved:" — the failure existed solely in autodoc.log, and
+        the same error looked like it "only happened" when the manual Publish
+        button was used (field report 2026-07-27). A step that can fail silently
+        will be assumed to have worked.
+        """
         self._reset_gen_button()
         self._set_status(f"Saved: {output_path.name}")
+
+        # A skipped publish (turned off, or no token) is not news — say nothing.
+        if publish is not None and not publish.skipped and not publish.ok:
+            self._set_status(f"Saved: {output_path.name} — BookStack publish FAILED")
+            QMessageBox.warning(
+                self,
+                "AutoDoc — BookStack publish failed",
+                "The documentation was generated and saved locally, but publishing "
+                "to BookStack failed:\n\n"
+                f"{publish.reason}\n\n"
+                "Use 'Publish to BookStack' to retry — it won't regenerate the "
+                "document or create a second page.",
+            )
+            return
+
+        detail = ""
+        if publish is not None and publish.ok:
+            self._set_status(f"Saved: {output_path.name} — published to BookStack")
+            detail = f"\n\nPublished to BookStack:\n{publish.page_url}"
+
         if self._confirm(
             "AutoDoc — Done",
-            f"Documentation saved to:\n{output_path}\n\nOpen the file now?",
+            f"Documentation saved to:\n{output_path}{detail}\n\nOpen the file now?",
         ):
             self._reveal(output_path)
 

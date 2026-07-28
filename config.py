@@ -53,6 +53,22 @@ class AutoDocConfig:
     provider: str = "anthropic"
     local_endpoint: str = "http://localhost:11434/v1/chat/completions"
     local_model: str = "gemma4-e4b-fast"
+    # BookStack publishing (v1.3 — see PRD-v1.3-bookstack.md). Off by default.
+    # The bot TOKEN is deliberately not here: this dataclass round-trips through
+    # write_config() below, which rewrites config.json in full, so a credential
+    # living here would be one Settings-tab save away from being wiped on any
+    # machine. It lives in its own file — see publish/token.py.
+    bookstack_enabled: bool = False
+    bookstack_base_url: str = "http://jcbookstack.jccmi.edu"
+    # Single holding book for now; how pages get organised is a later decision.
+    bookstack_book: str = "AutoDoc"
+    bookstack_timeout_s: int = 30
+    # Tag defaults. PROVISIONAL — validated against publish/tags.py's vocabulary,
+    # and an empty string means "don't apply this tag".
+    bookstack_tag_doc_type: str = "sop"
+    bookstack_tag_owner: str = "it-ops"
+    bookstack_tag_audience: str = "all-staff"
+    bookstack_tag_review_cycle: str = "ad-hoc"
 
 
 _DEFAULTS = {
@@ -74,6 +90,14 @@ _DEFAULTS = {
     "provider": "anthropic",
     "local_endpoint": "http://localhost:11434/v1/chat/completions",
     "local_model": "gemma4-e4b-fast",
+    "bookstack_enabled": False,
+    "bookstack_base_url": "http://jcbookstack.jccmi.edu",
+    "bookstack_book": "AutoDoc",
+    "bookstack_timeout_s": 30,
+    "bookstack_tag_doc_type": "sop",
+    "bookstack_tag_owner": "it-ops",
+    "bookstack_tag_audience": "all-staff",
+    "bookstack_tag_review_cycle": "ad-hoc",
 }
 
 
@@ -93,6 +117,15 @@ def load_config() -> AutoDocConfig:
 
 
 def write_config(cfg: AutoDocConfig) -> None:
+    """
+    Rewrite config.json in FULL from the in-memory config.
+
+    Consequence worth knowing before adding a key (HANDOFF.md invariant #9): the
+    dict below is written verbatim, so any key missing from it is DELETED from
+    config.json the first time a user saves Settings for an unrelated reason — no
+    error, no log line. Adding a config key means touching three places:
+    AutoDocConfig, _DEFAULTS, and this dict.
+    """
     config_path = get_app_dir() / "config.json"
     data = {
         "api_key": cfg.api_key,
@@ -113,6 +146,14 @@ def write_config(cfg: AutoDocConfig) -> None:
         "provider": cfg.provider,
         "local_endpoint": cfg.local_endpoint,
         "local_model": cfg.local_model,
+        "bookstack_enabled": cfg.bookstack_enabled,
+        "bookstack_base_url": cfg.bookstack_base_url,
+        "bookstack_book": cfg.bookstack_book,
+        "bookstack_timeout_s": cfg.bookstack_timeout_s,
+        "bookstack_tag_doc_type": cfg.bookstack_tag_doc_type,
+        "bookstack_tag_owner": cfg.bookstack_tag_owner,
+        "bookstack_tag_audience": cfg.bookstack_tag_audience,
+        "bookstack_tag_review_cycle": cfg.bookstack_tag_review_cycle,
     }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

@@ -40,8 +40,14 @@ SCREENSHOT DELETION:
   from disk on Save, so it stops consuming space and tokens.
 
 THREADING:
-  Widgets only on the Qt main thread. Inline generation runs on a worker thread
-  and reports back exclusively via ui_service.call_soon. See ui_service.py.
+  This window does no background work of its own — everything here runs on the
+  Qt main thread. Generate saves the session and hands off to the Sessions
+  window's pipeline (generation/run.py on a worker thread), which owns the
+  threading, the concurrency guard, and the result dialogs. The editor used to
+  carry a second copy of that pipeline for the case where no callback was
+  supplied; it was unreachable (open_editor_window has one caller, which always
+  passes one) and the two copies had already drifted, so it was removed. Don't
+  reintroduce generation logic here — add it to generation/run.py.
 
 STYLING:
   Governed by pyside6-ui-style-guide.md + theme/app.qss. No setStyleSheet, no
@@ -50,9 +56,8 @@ STYLING:
 
 import json
 import logging
-import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -73,7 +78,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import ui_service
 from recorder.screenshot import (
     RENDER_MODES,
     event_is_legacy,
@@ -100,7 +104,7 @@ def open_editor_window(
     session_data: dict,
     session_dir: Path,
     config,
-    on_generate: Optional[Callable[[dict, Path], None]] = None,
+    on_generate: Callable[[dict, Path], None],
 ) -> None:
     """
     Open the session editor. Must be called on the Qt main thread.
@@ -109,8 +113,9 @@ def open_editor_window(
         session_data:  Parsed session.json dict.
         session_dir:   Path to the session folder.
         config:        AutoDocConfig instance.
-        on_generate:   Optional callback(session_data, session_dir) invoked
-                       when the user clicks Generate from within the editor.
+        on_generate:   REQUIRED callback(session_data, session_dir) invoked when
+                       the user clicks Generate. The editor has no generation
+                       pipeline of its own — see this module's THREADING note.
     """
     win = SessionEditorWindow(session_data, session_dir, config, on_generate)
     _open_editors.append(win)
@@ -125,7 +130,7 @@ class SessionEditorWindow(QMainWindow):
         session_data: dict,
         session_dir: Path,
         config,
-        on_generate: Optional[Callable[[dict, Path], None]],
+        on_generate: Callable[[dict, Path], None],
     ) -> None:
         super().__init__()
         self.session_data = dict(session_data)   # local mutable copy
@@ -575,77 +580,18 @@ class SessionEditorWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _save_and_generate(self) -> None:
+        """
+        Save, then hand off to the Sessions window's pipeline and close.
+
+        Saving FIRST is load-bearing, not tidiness: generation/run.py re-reads
+        session.json from disk, so an unsaved transcript edit or screenshot
+        deletion would simply not be in the generated document.
+        """
         if not self._save():
             return
 
-        if self._on_generate_cb:
-            # Delegate to the Sessions window's generation pipeline.
-            self._on_generate_cb(self.session_data, self.session_dir)
-            self.close()
-        else:
-            self._run_generation_inline()
-
-    def _run_generation_inline(self) -> None:
-        self._gen_btn.setEnabled(False)
-        self._gen_btn.setText("Generating…")
-        self._set_status("Generating documentation in the background — the editor stays usable.")
-
-        def _work() -> None:
-            """Worker thread. Reports back via ui_service.call_soon ONLY."""
-            try:
-                from config import get_app_dir
-                from generation.generator import generate_documentation
-                from generation.renderers import write_outputs
-
-                markdown = generate_documentation(
-                    config=self.config,
-                    session_data=self.session_data,
-                    session_dir=self.session_dir,
-                )
-                paths = write_outputs(
-                    markdown=markdown,
-                    session_data=self.session_data,
-                    session_dir=self.session_dir,
-                    config=self.config,
-                    output_dir=get_app_dir() / self.config.output_dir,
-                )
-                ui_service.call_soon(lambda: self._on_done(paths[0]))
-            except Exception as exc:
-                log.exception("editor: inline generation failed")
-                msg = str(exc)
-                ui_service.call_soon(lambda: self._on_error(msg))
-
-        threading.Thread(target=_work, name="doc-generate-editor", daemon=True).start()
-
-    def _reset_gen_button(self) -> None:
-        self._gen_btn.setEnabled(True)
-        self._gen_btn.setText("Generate documentation")
-
-    def _on_done(self, output_path: Path) -> None:
-        self._reset_gen_button()
-        self._set_status(f"Saved: {output_path.name}")
-        answer = QMessageBox.question(
-            self,
-            "AutoDoc — Done",
-            f"Documentation saved to:\n{output_path}\n\nOpen now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            import subprocess
-            import sys
-
-            if sys.platform == "win32":
-                subprocess.Popen(["explorer", "/select,", str(output_path)])
-            else:
-                subprocess.Popen(["open", str(output_path)])
-
-    def _on_error(self, error: str) -> None:
-        self._reset_gen_button()
-        self._set_status("Generation failed.")
-        QMessageBox.critical(
-            self, "AutoDoc — Error", f"Could not generate documentation:\n\n{error}"
-        )
+        self._on_generate_cb(self.session_data, self.session_dir)
+        self.close()
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
