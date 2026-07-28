@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
 
 import ui_service
 from config import AutoDocConfig, write_config
+from publish import tags as tag_vocab
 from recorder.screenshot import RENDER_MODES
 from version import VERSION
 
@@ -109,6 +110,7 @@ class SettingsPanel(QWidget):
         root.addWidget(self._build_hotkeys_section())
         root.addWidget(self._build_screenshots_section())
         root.addWidget(self._build_output_section())
+        root.addWidget(self._build_bookstack_section())
         root.addWidget(self._build_backend_section())
         root.addWidget(self._build_updates_section())
         root.addLayout(self._build_save_bar())
@@ -266,6 +268,118 @@ class SettingsPanel(QWidget):
         ))
         return frame
 
+    def _build_bookstack_section(self) -> QFrame:
+        """
+        BookStack publishing (PRD-v1.3-bookstack.md).
+
+        The bot TOKEN is deliberately absent — it isn't a config key at all (it
+        would be wiped by the full-config rewrite on Save) and there's no masked
+        input anywhere in this app, matching the api_key rule in this module's
+        docstring. Instead the panel REPORTS token status, because the failure
+        mode without it is silent: publishing simply never happens, and the only
+        evidence is a line in autodoc.log.
+
+        base_url and timeout stay config.json-only. Nobody changes them, and
+        hiding them would need a collapsible-section pattern the style guide
+        doesn't have — not worth inventing one for two fields.
+        """
+        frame, lay = self._section("Publish to BookStack")
+        cfg = self.config_obj
+
+        self._bs_enabled = QCheckBox(
+            "Publish to BookStack automatically when documentation is generated"
+        )
+        self._bs_enabled.setChecked(bool(getattr(cfg, "bookstack_enabled", False)))
+        self._bs_enabled.toggled.connect(self._sync_bookstack_enabled)
+        lay.addWidget(self._bs_enabled)
+
+        self._bs_book = QLineEdit(getattr(cfg, "bookstack_book", "AutoDoc"))
+
+        def _vocab_combo(values: tuple, current: str) -> QComboBox:
+            combo = QComboBox()
+            combo.addItems(list(values))
+            # An out-of-vocabulary config value would otherwise silently show as
+            # the first entry, i.e. the UI would lie about what is configured.
+            combo.setCurrentText(current if current in values else values[0])
+            return combo
+
+        self._bs_doc_type = _vocab_combo(
+            tag_vocab.DOC_TYPE, getattr(cfg, "bookstack_tag_doc_type", "sop")
+        )
+        self._bs_owner = _vocab_combo(
+            tag_vocab.OWNER, getattr(cfg, "bookstack_tag_owner", "it-ops")
+        )
+        self._bs_audience = _vocab_combo(
+            tag_vocab.AUDIENCE, getattr(cfg, "bookstack_tag_audience", "all-staff")
+        )
+        self._bs_review = _vocab_combo(
+            tag_vocab.REVIEW_CYCLE, getattr(cfg, "bookstack_tag_review_cycle", "ad-hoc")
+        )
+
+        form = self._form()
+        form.addRow(
+            "Book:",
+            self._field_with_help(
+                self._bs_book,
+                "Holding book for generated pages. Created if it doesn't exist.",
+            ),
+        )
+        form.addRow(
+            "Doc type:",
+            self._field_with_help(
+                self._bs_doc_type, "Doc-Type tag. Pages are always tagged Status: draft."
+            ),
+        )
+        form.addRow(
+            "Owner:",
+            self._field_with_help(self._bs_owner, "Department responsible for the page."),
+        )
+        form.addRow(
+            "Audience:",
+            self._field_with_help(self._bs_audience, "Who the documentation is for."),
+        )
+        form.addRow(
+            "Review cycle:",
+            self._field_with_help(self._bs_review, "How often the page should be rechecked."),
+        )
+        lay.addLayout(form)
+
+        self._bs_token_status = self._caption(self._token_status_text())
+        lay.addWidget(self._bs_token_status)
+
+        self._bookstack_fields = (
+            self._bs_book,
+            self._bs_doc_type,
+            self._bs_owner,
+            self._bs_audience,
+            self._bs_review,
+        )
+        self._sync_bookstack_enabled(self._bs_enabled.isChecked())
+        return frame
+
+    @staticmethod
+    def _token_status_text() -> str:
+        """
+        Report whether the bot token is present and parseable.
+
+        Worth surfacing in the UI rather than leaving to the log: a missing token
+        makes publishing a no-op with no user-visible symptom at all, and "I
+        ticked the box and nothing happened" is otherwise unfalsifiable from the
+        Settings tab.
+        """
+        from publish.token import load_token, token_path
+
+        if load_token() is not None:
+            return f"Bot token: found ({token_path().name}). Pages publish as the bot user."
+        return (
+            f"Bot token: NOT found or unreadable at {token_path()} — "
+            "publishing will do nothing. See autodoc.log for the exact reason."
+        )
+
+    def _sync_bookstack_enabled(self, on: bool) -> None:
+        for widget in getattr(self, "_bookstack_fields", ()):
+            widget.setEnabled(on)
+
     def _build_backend_section(self) -> QFrame:
         frame, lay = self._section("AI backend")
         cfg = self.config_obj
@@ -382,13 +496,27 @@ class SettingsPanel(QWidget):
         (field report 2026-07-14: a user unchecked a format, still got the file,
         and couldn't tell whether Save had happened).
         """
-        for edit in (self._stop_edit, self._pause_edit, self._manual_edit, self._endpoint_edit):
+        for edit in (
+            self._stop_edit,
+            self._pause_edit,
+            self._manual_edit,
+            self._endpoint_edit,
+            self._bs_book,
+        ):
             edit.textEdited.connect(self._mark_dirty)
-        for combo in (self._mode_combo, self._provider_combo, self._whisper_combo):
+        for combo in (
+            self._mode_combo,
+            self._provider_combo,
+            self._whisper_combo,
+            self._bs_doc_type,
+            self._bs_owner,
+            self._bs_audience,
+            self._bs_review,
+        ):
             combo.currentTextChanged.connect(self._mark_dirty)
         # Editable combo: catch both typing and picking from the list.
         self._model_combo.currentTextChanged.connect(self._mark_dirty)
-        for box in self._format_boxes.values():
+        for box in (*self._format_boxes.values(), self._bs_enabled):
             box.toggled.connect(self._mark_dirty)
 
     def _mark_dirty(self, *_args) -> None:
@@ -495,6 +623,11 @@ class SettingsPanel(QWidget):
         if provider == "local" and not endpoint:
             errors.append("Provider 'local' needs a local endpoint URL.")
 
+        bs_enabled = self._bs_enabled.isChecked()
+        bs_book = self._bs_book.text().strip()
+        if bs_enabled and not bs_book:
+            errors.append("BookStack publishing needs a book name.")
+
         if errors:
             self._status.setText("Not saved — " + " • ".join(errors))
             return
@@ -508,6 +641,12 @@ class SettingsPanel(QWidget):
         cfg.provider = provider
         cfg.local_endpoint = endpoint
         cfg.local_model = self._model_combo.currentText().strip()
+        cfg.bookstack_enabled = bs_enabled
+        cfg.bookstack_book = bs_book
+        cfg.bookstack_tag_doc_type = self._bs_doc_type.currentText()
+        cfg.bookstack_tag_owner = self._bs_owner.currentText()
+        cfg.bookstack_tag_audience = self._bs_audience.currentText()
+        cfg.bookstack_tag_review_cycle = self._bs_review.currentText()
         restart_needed = self._whisper_combo.currentText() != cfg.whisper_model
         cfg.whisper_model = self._whisper_combo.currentText()
 
@@ -521,6 +660,17 @@ class SettingsPanel(QWidget):
         msg = "Settings saved."
         if restart_needed:
             msg += " Restart AutoDoc to load the new speech model."
+
+        # Re-check on save rather than only at panel build: the token may have
+        # been dropped in while this window was open.
+        from publish.token import load_token
+
+        self._bs_token_status.setText(self._token_status_text())
+        if bs_enabled and load_token() is None:
+            msg += (
+                " WARNING: publishing is on but no BookStack token was found, "
+                "so nothing will be published."
+            )
         self._dirty = False
         self._status.setText(msg)
         log.info("settings saved via Settings tab")

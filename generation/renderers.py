@@ -17,6 +17,27 @@ The markdown→HTML/docx conversion is deliberately NOT a general markdown
 engine. The prompt mandates a narrow structure (H1/H2/H3 headings, paragraphs,
 "- " bullet lists, **bold**) and that is all this parses. If the prompt's
 output format changes, update _iter_blocks() to match.
+
+PUBLIC API — two steps, deliberately separate:
+
+    prepared = prepare_document(markdown, session_data, session_dir, config)
+    paths    = write_outputs(prepared, session_data, config, output_dir)
+
+prepare_document() does the model-output normalization ONCE and hands back a
+PreparedDocument. Every consumer of generated documentation — the file writers
+here, and any publishing destination (see PRD-v1.3-bookstack.md) — must go
+through it rather than re-parsing the model's raw markdown. Two reasons, both
+learned the hard way:
+
+  1. _hoist_inline_tokens() is what makes weaker models' inline token placement
+     render at all. A consumer that parses raw markdown silently drops images.
+  2. PreparedDocument.images is whatever render_event_to_cache() returns — the
+     session's render mode, click circle, and redaction regions already applied.
+     A consumer that resolves its own image paths from screenshots/ would emit
+     un-redacted originals while the local .docx looked correct. (Note
+     render_event_to_cache legitimately returns the source path itself when
+     there is nothing to apply — raw mode with no redactions — so "always use
+     what it returned" is the rule, not "never touch screenshots/".)
 """
 
 import base64
@@ -24,6 +45,7 @@ import html as html_module
 import logging
 import re
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from generation.content import resolve_session_mode
@@ -37,18 +59,76 @@ VALID_FORMATS = ("md", "html", "docx")
 
 
 # ------------------------------------------------------------------ #
-# Public entry point                                                   #
+# Public entry points                                                  #
 # ------------------------------------------------------------------ #
 
-def write_outputs(
+@dataclass
+class PreparedDocument:
+    """
+    Generated documentation, normalized once and ready for any destination.
+
+    doc     — markdown whose remaining {{screenshot:id}} tokens are guaranteed
+              valid, unique, and alone on their own line.
+    images  — event_id → render_event_to_cache() path, chronological. Render mode
+              and redaction regions already applied. Use these paths as given;
+              don't re-resolve from screenshots/.
+    stem    — filesystem-safe filename stem (no extension).
+    title   — the document's H1 as written, for destinations that want a human
+              title rather than a filename. Empty if the model omitted an H1.
+    """
+
+    doc: str
+    images: dict[str, Path] = field(default_factory=dict)
+    stem: str = "session"
+    title: str = ""
+
+
+def prepare_document(
     markdown: str,
     session_data: dict,
     session_dir: Path,
     config,
+) -> PreparedDocument:
+    """
+    Normalize raw model output into a PreparedDocument.
+
+    Call this exactly once per generation and pass the result to every
+    destination — see this module's docstring for why re-parsing the raw
+    markdown downstream is a defect, not a shortcut.
+    """
+    fallback = session_data.get("session_id", "session")
+    images = _resolve_images(session_data, session_dir, config)
+    return PreparedDocument(
+        doc=_normalize_tokens(markdown, images),
+        images=images,
+        # Both derived from the RAW markdown: _normalize_tokens only touches
+        # screenshot tokens, but deriving from it would couple the output
+        # filename to token-hoisting behaviour for no reason.
+        stem=_derive_stem(markdown, fallback),
+        title=_derive_title(markdown),
+    )
+
+
+def substitute_tokens(doc: str, resolve) -> str:
+    """
+    Replace every {{screenshot:id}} token via resolve(event_id) -> str.
+
+    Public so destinations don't each carry their own copy of the token regex —
+    the pattern belongs in exactly one place. Return "" from resolve to strip a
+    token (used for the placeholder body BookStack needs before its images can be
+    uploaded).
+    """
+    return _TOKEN_RE.sub(lambda m: resolve(m.group(1)), doc)
+
+
+def write_outputs(
+    prepared: PreparedDocument,
+    session_data: dict,
+    config,
     output_dir: Path,
 ) -> list[Path]:
     """
-    Write the generated document in every configured output format.
+    Write a PreparedDocument in every configured output format.
 
     Returns the list of written paths (first = primary, shown in the UI).
     Raises only if NO format could be written; individual format failures
@@ -68,9 +148,9 @@ def write_outputs(
     if not formats:
         formats = ["md"]
 
-    stem = _derive_stem(markdown, session_data.get("session_id", "session"))
-    images = _resolve_images(session_data, session_dir, config)
-    doc = _prepare_document(markdown, images)
+    doc = prepared.doc
+    images = prepared.images
+    stem = prepared.stem
 
     written: list[Path] = []
     errors: list[str] = []
@@ -112,7 +192,7 @@ def _resolve_images(session_data: dict, session_dir: Path, config) -> dict:
     return images
 
 
-def _prepare_document(markdown: str, images: dict) -> str:
+def _normalize_tokens(markdown: str, images: dict) -> str:
     """
     Normalize the model's token usage:
       - keep the first occurrence of each KNOWN id, drop later duplicates,
@@ -364,17 +444,35 @@ def _safe_dirname(name: str) -> str:
     return safe or "session"
 
 
-def _derive_stem(markdown: str, fallback: str) -> str:
-    """Extract the H1 heading and convert it to a safe filename stem."""
+def _iter_h1_titles(markdown: str):
+    """Yield each H1's text, in document order."""
     for line in markdown.splitlines():
         stripped = line.strip()
         if stripped.startswith("# "):
-            title = stripped[2:].strip()
-            safe = re.sub(r"[^\w\s-]", "", title)
-            safe = re.sub(r"[\s]+", "_", safe.strip())
-            safe = safe[:80]
-            if safe:
-                return safe
+            yield stripped[2:].strip()
+
+
+def _derive_title(markdown: str) -> str:
+    """
+    The document's first H1 exactly as the model wrote it, or "" if there is none.
+
+    Kept separate from _derive_stem because a filename stem is not a title:
+    "Reset a Locked Account" becomes "Reset_a_Locked_Account" as a stem, which is
+    correct on disk and wrong as a page heading anywhere else.
+    """
+    return next((t for t in _iter_h1_titles(markdown) if t), "")
+
+
+def _derive_stem(markdown: str, fallback: str) -> str:
+    """Extract the H1 heading and convert it to a safe filename stem."""
+    # Keeps the original semantics: an H1 that sanitizes to nothing (e.g. one
+    # made entirely of punctuation) falls through to the next H1, not to fallback.
+    for title in _iter_h1_titles(markdown):
+        safe = re.sub(r"[^\w\s-]", "", title)
+        safe = re.sub(r"[\s]+", "_", safe.strip())
+        safe = safe[:80]
+        if safe:
+            return safe
     return fallback
 
 

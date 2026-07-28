@@ -189,6 +189,10 @@ exports/
 # instead and let each install create its own config.json.
 config.json
 
+# BookStack bot token (publish/token.py). Base64'd "<id>:<secret>" — obfuscated,
+# not encrypted, so it must never be committed: this repo is public.
+bookstack.token
+
 # Local git history backup bundles created during repo cleanup
 *.bundle
 
@@ -208,3 +212,4 @@ _apply_update.bat
 PRD-v1.1-features.md
 HANDOFF.md
 pyside6-ui-style-guide.md
+PRD-v1.3-bookstack.md

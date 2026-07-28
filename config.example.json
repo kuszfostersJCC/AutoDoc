@@ -1,18 +1,42 @@
 {
-  "_comment": "Copy this file to config.json next to AutoDoc.exe and fill in the fields below. config.json is gitignored on purpose — never commit real API keys.",
+  "_comment": "Copy this file to config.json next to AutoDoc.exe and fill in the fields below. config.json is gitignored on purpose — never commit real API keys. Regenerated 2026-07-27 from config.py::_DEFAULTS; if you add a config key, update this file too.",
 
   "api_key": "",
   "whisper_model": "base",
-  "focus_radius_px": 200,
-  "blur_strength": 15,
   "sessions_dir": "sessions",
   "output_dir": "output",
   "max_screenshots_per_session": 100,
   "max_image_dimension": 1280,
 
-  "_provider_comment": "provider: 'anthropic' uses the Claude API (needs api_key + claude_model below). 'local' uses any OpenAI-compatible local vision server (Ollama, LM Studio, etc.) — narration and blurred screenshots never leave the machine/network. Switching providers requires no code changes.",
+  "_provider_comment": "provider: 'anthropic' uses the Claude API (needs api_key + claude_model below). 'local' uses any OpenAI-compatible local vision server (llama.cpp, Ollama, LM Studio) — narration and screenshots never leave the machine/network. Switching providers requires no code changes. A local model needs a paired mmproj projector to do vision at all.",
   "provider": "anthropic",
   "claude_model": "claude-sonnet-5",
   "local_endpoint": "http://localhost:11434/v1/chat/completions",
-  "local_model": "llava"
+  "local_model": "gemma4-e4b-fast",
+
+  "_screenshot_comment": "screenshot_mode is a RENDER setting, not a capture setting — screenshots are always stored raw, so this is changeable per session after the fact in the session editor. 'raw' | 'blurred' (privacy blur outside a clear circle at the click) | 'circled' (red ring at the click).",
+  "screenshot_mode": "raw",
+  "circle_radius_px": 36,
+  "focus_radius_px": 200,
+  "blur_strength": 15,
+
+  "_output_comment": "output_formats: any subset of md/html/docx. The first entry is what the 'Saved:' dialog offers to open.",
+  "output_formats": ["docx", "html", "md"],
+
+  "_hotkey_comment": "Global hotkeys, active only while recording. pynput GlobalHotKeys syntax; empty string disables one. Avoid ctrl+shift+p — that opens the print dialog in browsers and Office, which is exactly where workflows get recorded.",
+  "manual_capture_hotkey": "<ctrl>+<shift>+s",
+  "pause_hotkey": "<ctrl>+<alt>+p",
+  "stop_hotkey": "<ctrl>+<shift>+e",
+
+  "_bookstack_comment": "BookStack publishing (v1.3). When enabled, Generate also pushes a markdown page with inline screenshots to bookstack_book. The bot token is NOT a setting here on purpose — it lives in its own file (see publish/token.py), because this whole file is rewritten from memory whenever the Settings tab saves, which would wipe a credential stored here.",
+  "bookstack_enabled": false,
+  "bookstack_base_url": "http://jcbookstack.jccmi.edu",
+  "bookstack_book": "AutoDoc",
+  "bookstack_timeout_s": 30,
+
+  "_bookstack_tag_comment": "Tag defaults, validated against publish/tags.py's controlled vocabulary — an unrecognised value is dropped, not passed through, so a typo costs one tag rather than splitting a BookStack filter. Empty string skips a tag. Status is always 'draft' on publish and is not configurable.",
+  "bookstack_tag_doc_type": "sop",
+  "bookstack_tag_owner": "it-ops",
+  "bookstack_tag_audience": "all-staff",
+  "bookstack_tag_review_cycle": "ad-hoc"
 }
