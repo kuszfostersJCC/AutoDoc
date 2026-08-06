@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- stroke MIRRORS theme/tokens.py _DARK["text_on_accent"] (#0F1419).
+       DARK, not white — and that is the whole reason this file has to exist
+       separately from the light one. The dark accent (#62A5DE) is bright, so
+       the tick on top of it must be near-black; a white tick would be a
+       near-invisible smear. If you ever "unify" the two check.svg files, the
+       checkbox silently stops reading as checked in one theme. -->
+  <path d="M3.5 8.5 L6.5 11.5 L12.5 4.5" fill="none" stroke="#0F1419"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

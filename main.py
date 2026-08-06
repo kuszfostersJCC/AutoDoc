@@ -31,8 +31,8 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox
 
 import ui_service
-from config import get_app_dir, load_config
-from theme import load_theme
+from config import default_config, get_app_dir, load_config
+from theme import apply_theme
 
 
 def _setup_logging() -> None:
@@ -202,30 +202,13 @@ def _install_crash_visibility() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
-# ------------------------------------------------------------------ #
-# Default config                                                       #
-# ------------------------------------------------------------------ #
-
-_DEFAULT_CONFIG = {
-    "api_key": "",
-    "whisper_model": "base",
-    "focus_radius_px": 200,
-    "blur_strength": 15,
-    "screenshot_mode": "blurred",
-    "circle_radius_px": 36,
-    "output_formats": ["docx", "html", "md"],
-    "manual_capture_hotkey": "<ctrl>+<shift>+s",
-    "pause_hotkey": "<ctrl>+<alt>+p",
-    "stop_hotkey": "<ctrl>+<shift>+e",
-    "sessions_dir": "sessions",
-    "output_dir": "output",
-    "claude_model": "claude-sonnet-5",
-    "max_screenshots_per_session": 100,
-    "max_image_dimension": 1280,
-    "provider": "anthropic",
-    "local_endpoint": "http://localhost:11434/v1/chat/completions",
-    "local_model": "llava",
-}
+# NOTE: there used to be a `_DEFAULT_CONFIG` dict here, used to write the
+# first-run config.json. It was deleted on 2026-07-29 — it was a hand-maintained
+# second copy of config.py's defaults and had drifted from them (it shipped
+# screenshot_mode "blurred" and local_model "llava", and it WON on a fresh
+# install because it's what created the file). The bootstrap below now dumps
+# config.default_config(), so first-run values come from the same dataclass as
+# everything else and cannot disagree. Don't reintroduce a local copy.
 
 
 # ------------------------------------------------------------------ #
@@ -284,19 +267,38 @@ def main() -> None:
     # Applies to every window and dialog in the app — title bar, taskbar,
     # Alt-Tab. Individual windows never set their own icon.
     app.setWindowIcon(_app_icon())
-    load_theme(app)          # Fusion + app.qss + the one setFont call
     ui_service.init()        # thread seam; main thread only, after QApplication
 
     config_path = get_app_dir() / "config.json"
     is_frozen = getattr(sys, "frozen", False)
 
-    # Create config.json with defaults if it doesn't exist yet.
+    # Create config.json with defaults if it doesn't exist yet. Those defaults
+    # are the real deployment baseline (provider "local", the district AI
+    # server) — see config.py's module docstring — so a fresh or reimaged
+    # machine bootstraps to a config that actually works rather than to
+    # "anthropic with no key".
     if not config_path.exists():
         with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(_DEFAULT_CONFIG, f, indent=2)
+            json.dump(default_config(), f, indent=2)
 
     with open(config_path, encoding="utf-8") as f:
         raw = json.load(f)
+
+    # Theming happens HERE, not immediately after QApplication, because the
+    # light/dark choice is a config value (2026-07-29) and this is the first
+    # point at which config.json has been created-if-missing and read.
+    #
+    # The position is bounded on both sides and both bounds are real:
+    #   - it cannot move earlier, because `raw` doesn't exist yet;
+    #   - it cannot move later, because _prompt_for_api_key() below puts a
+    #     QMessageBox and a QInputDialog on screen, and load_config()'s failure
+    #     path raises a QMessageBox too. Theming after those means a source run
+    #     or a broken-config run shows its first dialogs unstyled — in dark mode
+    #     that's a bright white dialog in front of nothing.
+    # Reads raw JSON rather than the AutoDocConfig, deliberately: a malformed
+    # config must still produce a THEMED error dialog, and load_config() can't
+    # be reached before that dialog exists.
+    apply_theme(app, raw.get("theme"))   # Fusion + palette + app.qss + setFont
 
     provider = (raw.get("provider") or "anthropic").strip().lower()
 

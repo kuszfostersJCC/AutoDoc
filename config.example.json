@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy this file to config.json next to AutoDoc.exe and fill in the fields below. config.json is gitignored on purpose — never commit real API keys. Regenerated 2026-07-27 from config.py::_DEFAULTS; if you add a config key, update this file too.",
+  "_comment": "Copy this file to config.json next to AutoDoc.exe. config.json is gitignored on purpose — never commit real API keys. Regenerated 2026-07-29 from config.py's AutoDocConfig defaults, which are now the single source of truth; the values below ARE the shipped deployment baseline, so a fresh install that just runs the app gets this file written for it automatically and only needs editing to change something. This file is documentation for humans — no code reads it, so it can only go stale, never break anything.",
 
   "api_key": "",
   "whisper_model": "base",
@@ -8,11 +8,11 @@
   "max_screenshots_per_session": 100,
   "max_image_dimension": 1280,
 
-  "_provider_comment": "provider: 'anthropic' uses the Claude API (needs api_key + claude_model below). 'local' uses any OpenAI-compatible local vision server (llama.cpp, Ollama, LM Studio) — narration and screenshots never leave the machine/network. Switching providers requires no code changes. A local model needs a paired mmproj projector to do vision at all.",
-  "provider": "anthropic",
-  "claude_model": "claude-sonnet-5",
-  "local_endpoint": "http://localhost:11434/v1/chat/completions",
+  "_provider_comment": "provider: 'local' (the default, and the JCC deployment) sends narration and screenshots to an OpenAI-compatible vision server on the district network — nothing leaves the LAN, which is the FERPA-relevant property. 'anthropic' uses the Claude API instead and needs a real api_key + claude_model. Switching requires no code changes. A local model needs a paired mmproj projector to do vision at all — renaming a file to add '-vision' does nothing.",
+  "provider": "local",
+  "local_endpoint": "http://172.20.28.203:8080/v1/chat/completions",
   "local_model": "gemma4-e4b-fast",
+  "claude_model": "claude-sonnet-5",
 
   "_screenshot_comment": "screenshot_mode is a RENDER setting, not a capture setting — screenshots are always stored raw, so this is changeable per session after the fact in the session editor. 'raw' | 'blurred' (privacy blur outside a clear circle at the click) | 'circled' (red ring at the click).",
   "screenshot_mode": "raw",
@@ -28,7 +28,7 @@
   "pause_hotkey": "<ctrl>+<alt>+p",
   "stop_hotkey": "<ctrl>+<shift>+e",
 
-  "_bookstack_comment": "BookStack publishing (v1.3). When enabled, Generate also pushes a markdown page with inline screenshots to bookstack_book. The bot token is NOT a setting here on purpose — it lives in its own file (see publish/token.py), because this whole file is rewritten from memory whenever the Settings tab saves, which would wipe a credential stored here.",
+  "_bookstack_comment": "BookStack publishing (v1.3). When enabled, Generate also pushes a markdown page with inline screenshots to bookstack_book. The bot token is NOT a setting here on purpose — it lives in its own file (see publish/token.py), because this whole file is rewritten from memory whenever the Settings tab saves, which would wipe a credential stored here. Note that flipping this default to true reaches only NEW installs: defaults fill keys that are absent, and an existing config.json already has this key set to false.",
   "bookstack_enabled": false,
   "bookstack_base_url": "http://jcbookstack.jccmi.edu",
   "bookstack_book": "AutoDoc",
@@ -38,5 +38,8 @@
   "bookstack_tag_doc_type": "sop",
   "bookstack_tag_owner": "it-ops",
   "bookstack_tag_audience": "all-staff",
-  "bookstack_tag_review_cycle": "ad-hoc"
+  "bookstack_tag_review_cycle": "ad-hoc",
+
+  "_theme_comment": "theme: 'light' | 'dark'. Changeable from the Settings tab, where it applies immediately. An unrecognised value falls back to 'light' with a line in autodoc.log rather than failing to start.",
+  "theme": "light"
 }
