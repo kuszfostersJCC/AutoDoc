@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- stroke MIRRORS theme/tokens.py _LIGHT["text_on_accent"] (#FFFFFF).
+       This tick is drawn on the $accent checkbox fill, so it must match that
+       token or the checkmark disappears into its own background. Nothing
+       verifies the two agree — see pyside6-ui-style-guide.md §1.4. -->
+  <path d="M3.5 8.5 L6.5 11.5 L12.5 4.5" fill="none" stroke="#FFFFFF"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

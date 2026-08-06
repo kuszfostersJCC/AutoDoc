@@ -14,6 +14,16 @@ config.write_config(). Consequences, stated per field in the UI:
   - hotkeys: read when a recording starts → apply to the NEXT recording,
   - whisper model: loaded once at startup → requires an app restart.
 
+Theme is the ONE field that repaints the app the moment you change it, before
+any Save. It still needs Save to survive a restart, and the caption says so.
+Applying it on Save instead would mean choosing a theme from a dropdown and
+seeing nothing happen, which reads as a broken control; persisting it on change
+instead would mean write_config() firing at a moment the user didn't ask for a
+save — and because write_config() rewrites the file in FULL from the in-memory
+config (invariant #9), that write would also silently commit whatever other
+fields happened to be in memory. Live-apply + explicit Save is the only
+combination that keeps both properties.
+
 Save writes the FULL config back to config.json. If someone hand-edits the
 deployed config.json while AutoDoc is open and then presses Save here, the
 hand-edit is silently overwritten by whatever the app held in memory. That's a
@@ -36,6 +46,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -57,6 +68,7 @@ import ui_service
 from config import AutoDocConfig, write_config
 from publish import tags as tag_vocab
 from recorder.screenshot import RENDER_MODES
+from theme import DEFAULT_THEME, THEMES, apply_theme, resolve_theme
 from version import VERSION
 
 log = logging.getLogger(__name__)
@@ -65,6 +77,11 @@ _FORMAT_ORDER = ("docx", "html", "md")
 _FORMAT_LABELS = {"docx": "Word (.docx)", "html": "Web page (.html)", "md": "Markdown (.md)"}
 _WHISPER_MODELS = ("tiny", "base", "small")
 _PROVIDERS = ("anthropic", "local")
+# §3 requires sentence case in the UI; the config values are lowercase
+# internals. Keyed off THEMES so adding a palette can't leave a theme
+# unreachable from the dropdown with no error.
+_THEME_LABELS = {"light": "Light", "dark": "Dark"}
+_THEME_BY_LABEL = {label: name for name, label in _THEME_LABELS.items()}
 
 
 class SettingsPanel(QWidget):
@@ -107,6 +124,12 @@ class SettingsPanel(QWidget):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(24)          # gap between sections
 
+        # Appearance goes FIRST deliberately. The other sections run in rough
+        # workflow order (record → screenshots → output → publish → backend →
+        # updates); appearance belongs to none of that, so it bookends rather
+        # than interleaves, and the top is where someone hunting for dark mode
+        # looks first.
+        root.addWidget(self._build_appearance_section())
         root.addWidget(self._build_hotkeys_section())
         root.addWidget(self._build_screenshots_section())
         root.addWidget(self._build_output_section())
@@ -192,6 +215,66 @@ class SettingsPanel(QWidget):
         return row
 
     # ---- Sections --------------------------------------------------- #
+
+    def _build_appearance_section(self) -> QFrame:
+        frame, lay = self._section("Appearance")
+
+        self._theme_combo = QComboBox()
+        self._theme_combo.addItems([_THEME_LABELS[name] for name in THEMES])
+        # resolve_theme() rather than the raw config value: an out-of-vocabulary
+        # theme in config.json is already being ignored at startup, and the
+        # dropdown must agree with what's actually on screen rather than echo a
+        # value nothing honoured.
+        active = resolve_theme(getattr(self.config_obj, "theme", DEFAULT_THEME))
+        self._theme_combo.setCurrentText(_THEME_LABELS[active])
+        self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
+
+        # grow=False: the caption below spans the panel (same reasoning as the
+        # Screenshots section), so the combo must not stretch across the field
+        # column.
+        form = self._form(grow=False)
+        form.addRow("Theme:", self._theme_combo)
+        lay.addLayout(form)
+        lay.addWidget(self._caption(
+            "Changes the app's own windows immediately — click Save settings to "
+            "keep it for next launch. Your screenshots are never altered by this; "
+            "they're shown exactly as captured in both themes."
+        ))
+        return frame
+
+    def _on_theme_changed(self, label: str) -> None:
+        """
+        Repaint the whole app in the chosen theme.
+
+        DEFERRED through ui_service rather than applied inline, and that is not
+        incidental: apply_theme() unpolishes and re-polishes EVERY live widget,
+        this combo box among them, and running that from inside the combo's own
+        currentTextChanged emission restyles a widget Qt is still mid-signal on
+        while its popup may not have finished closing. call_soon() posts via
+        QueuedConnection, so the switch happens once the event loop is back at
+        idle. It's the same seam worker threads use — called here from the main
+        thread purely for the deferral, which is a legitimate use of it.
+        """
+        theme = _THEME_BY_LABEL.get(label)
+        if theme is None:
+            return
+        ui_service.call_soon(lambda: self._apply_theme_now(theme))
+
+    def _apply_theme_now(self, theme: str) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            apply_theme(app, theme)
+        except Exception:
+            # A cosmetic failure must not take out the Settings tab. The dirty
+            # marker has already run by now, so overwriting the status text here
+            # is the correct precedence — a failed switch is more important than
+            # "unsaved changes".
+            log.exception("theme switch to %r failed", theme)
+            self._status.setText(
+                f"Could not switch to the {theme} theme — see autodoc.log."
+            )
 
     def _build_hotkeys_section(self) -> QFrame:
         frame, lay = self._section("Keyboard shortcuts (while recording)")
@@ -505,6 +588,14 @@ class SettingsPanel(QWidget):
         ):
             edit.textEdited.connect(self._mark_dirty)
         for combo in (
+            # _theme_combo is here as well as having its own handler: the theme
+            # applies live but is NOT persisted until Save, so it is genuinely
+            # an unsaved change and must say so. Connected AFTER
+            # _on_theme_changed (which _build wires up), so on a theme change
+            # the dirty message lands last and is what the user sees — unless
+            # the switch itself failed, in which case the deferred handler
+            # overwrites it with the error.
+            self._theme_combo,
             self._mode_combo,
             self._provider_combo,
             self._whisper_combo,
@@ -633,6 +724,10 @@ class SettingsPanel(QWidget):
             return
 
         cfg = self.config_obj
+        # Already applied live by _on_theme_changed; this is only the persist
+        # half. Falls back to the current value rather than a literal default so
+        # a label that somehow isn't in the map can't silently reset the theme.
+        cfg.theme = _THEME_BY_LABEL.get(self._theme_combo.currentText(), cfg.theme)
         cfg.stop_hotkey = self._stop_edit.text().strip()
         cfg.pause_hotkey = self._pause_edit.text().strip()
         cfg.manual_capture_hotkey = self._manual_edit.text().strip()
