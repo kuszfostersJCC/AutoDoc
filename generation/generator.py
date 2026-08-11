@@ -1,11 +1,12 @@
 """
-generation/generator.py — Single, provider-agnostic entry point for documentation
+generation/generator.py — Single, backend-agnostic entry point for documentation
 generation. This is the only function the UI layer (sessions_window, session_editor)
 should call.
 
-Swapping between the Claude API and a local vision model is a config.json change
-("provider": "anthropic" | "local") — nothing here, in generation/content.py, or in
-the UI needs to change when that happens.
+Backend-agnostic still means something after the 2026-08-06 removal of the
+Anthropic path, even though there is only one backend left: nothing here or in
+generation/content.py knows a wire format, an endpoint or a credential. That
+separation is what kept the removal a two-file change.
 """
 
 from pathlib import Path
@@ -21,11 +22,10 @@ def generate_documentation(
     session_dir: Path,
 ) -> str:
     """
-    Generate markdown documentation for a session using whichever backend is
-    configured (config.provider).
+    Generate markdown documentation for a session using the configured AI server.
 
     Args:
-        config:       Loaded AutoDocConfig (holds provider selection + credentials).
+        config:       Loaded AutoDocConfig (holds the endpoint, model and key).
         session_data: Full parsed session.json dict (may contain edited_full_transcript).
         session_dir:  Path to the session folder (for resolving image filenames).
 

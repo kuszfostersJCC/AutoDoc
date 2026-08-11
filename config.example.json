@@ -1,18 +1,22 @@
 {
-  "_comment": "Copy this file to config.json next to AutoDoc.exe. config.json is gitignored on purpose — never commit real API keys. Regenerated 2026-07-29 from config.py's AutoDocConfig defaults, which are now the single source of truth; the values below ARE the shipped deployment baseline, so a fresh install that just runs the app gets this file written for it automatically and only needs editing to change something. This file is documentation for humans — no code reads it, so it can only go stale, never break anything.",
+  "_comment": "Copy this file to config.json next to AutoDoc.exe. config.json is gitignored on purpose. Regenerated 2026-08-06 from config.py's AutoDocConfig defaults, which are the single source of truth; the values below ARE the shipped deployment baseline, so a fresh install that just runs the app gets this file written for it automatically and only needs editing to change something. This file is documentation for humans — no code reads it, so it can only go stale, never break anything.",
 
-  "api_key": "",
   "whisper_model": "base",
   "sessions_dir": "sessions",
   "output_dir": "output",
   "max_screenshots_per_session": 100,
   "max_image_dimension": 1280,
 
-  "_provider_comment": "provider: 'local' (the default, and the JCC deployment) sends narration and screenshots to an OpenAI-compatible vision server on the district network — nothing leaves the LAN, which is the FERPA-relevant property. 'anthropic' uses the Claude API instead and needs a real api_key + claude_model. Switching requires no code changes. A local model needs a paired mmproj projector to do vision at all — renaming a file to add '-vision' does nothing.",
-  "provider": "local",
+  "_ai_server_comment": "AutoDoc talks to the district's on-premises AI server and nothing else — the Anthropic/Claude API backend was removed on 2026-08-06, along with the 'provider', 'api_key' and 'claude_model' keys. Narration and screenshots never leave the network, which is the FERPA-relevant property. See the server's own README for the full stack.",
+
+  "_endpoint_comment": "MUST be port 8080. That is the metering proxy, and it is the only endpoint that counts tokens per application. Port 8081 is the llama-server router: it answers requests correctly, which makes it a tempting fix when the proxy is down, but tokens sent there are invisible to every metric and dashboard. AutoDoc warns about 8081 in the Settings tab, in autodoc.log and at build time, but does not block it — it is a legitimate emergency fallback.",
   "local_endpoint": "http://172.20.28.203:8080/v1/chat/completions",
+
+  "_model_comment": "Must match a model id the server actually serves (Settings tab → Fetch lists them). Only ONE model is resident on the GPU at a time, so picking something other than the shared default means every generation may trigger a model swap — tens of seconds of cold start, and it evicts whatever the other applications were using. A model without a paired mmproj vision projector cannot see screenshots at all and will quietly produce narration-only documentation; Fetch flags those.",
   "local_model": "gemma4-e4b-fast",
-  "claude_model": "claude-sonnet-5",
+
+  "_api_key_comment": "THE METERING CREDENTIAL, not access control. The server accepts requests with no key and attributes them to 'chat-ui', so a blank or wrong value here produces perfectly good documentation while folding AutoDoc's usage into aggregate staff chat and corrupting the per-app record the metering stack exists to produce. There is no user-visible symptom — the Settings tab reports attribution status and the backend logs a warning on every generation. This is the 'doc-generator' key; if the server rotates it, generation starts failing with an explicit 401/403 message.",
+  "local_api_key": "sk-nuPkxLzZ3YFETKOCwhvCXRPjdWB4Ip_J",
 
   "_screenshot_comment": "screenshot_mode is a RENDER setting, not a capture setting — screenshots are always stored raw, so this is changeable per session after the fact in the session editor. 'raw' | 'blurred' (privacy blur outside a clear circle at the click) | 'circled' (red ring at the click).",
   "screenshot_mode": "raw",
@@ -28,7 +32,7 @@
   "pause_hotkey": "<ctrl>+<alt>+p",
   "stop_hotkey": "<ctrl>+<shift>+e",
 
-  "_bookstack_comment": "BookStack publishing (v1.3). When enabled, Generate also pushes a markdown page with inline screenshots to bookstack_book. The bot token is NOT a setting here on purpose — it lives in its own file (see publish/token.py), because this whole file is rewritten from memory whenever the Settings tab saves, which would wipe a credential stored here. Note that flipping this default to true reaches only NEW installs: defaults fill keys that are absent, and an existing config.json already has this key set to false.",
+  "_bookstack_comment": "BookStack publishing (v1.3). When enabled, Generate also pushes a markdown page with inline screenshots to bookstack_book. The bot token is NOT a setting here on purpose — it lives in its own file (see publish/token.py). Note that the AI server's local_api_key above deliberately does NOT follow that pattern: the BookStack token already exists on every machine, whereas the metering key is new, and a config default is the only thing that reaches an already-deployed install (see config.py's module docstring).",
   "bookstack_enabled": false,
   "bookstack_base_url": "http://jcbookstack.jccmi.edu",
   "bookstack_book": "AutoDoc",

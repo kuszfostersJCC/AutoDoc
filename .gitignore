@@ -27,10 +27,20 @@ share/python-wheels/
 MANIFEST
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+#  This block came from GitHub's Python .gitignore template, whose assumption
+#  ("these files are written by a python script from a template") is FALSE for
+#  this project. `autodoc.spec` is hand-maintained source — it carries the
+#  post-build copy steps, the excludes/hiddenimports lists, and the build-time
+#  config guards, and its header comment is required reading before building.
+#
+#  Because of the bare `*.spec` below, autodoc.spec was silently untracked from
+#  the repo's creation until 2026-08-06: the build was unreproducible from a
+#  clean clone and nobody could tell, because the file was always present on the
+#  one machine that builds. The negation is what fixes it. Do not remove it, and
+#  do not "tidy" it into `*.spec` alone.
 *.manifest
 *.spec
+!autodoc.spec
 
 # Installer logs
 pip-log.txt
@@ -185,8 +195,12 @@ models/
 sessions/
 output/
 exports/
-# AutoDoc local config — contains the Anthropic API key. Ship config.example.json
-# instead and let each install create its own config.json.
+# AutoDoc local config — contains the AI server's metering API key. Ship
+# config.example.json instead and let each install create its own config.json.
+# NOTE: as of 2026-08-06 the metering key ALSO has a default in config.py, which
+# IS committed, so this exclusion no longer keeps that key out of the public
+# repo. Deliberate trade — see HANDOFF.md, "Known exposure, flagged not
+# resolved". This line still matters for per-machine overrides.
 config.json
 
 # BookStack bot token (publish/token.py). Base64'd "<id>:<secret>" — obfuscated,

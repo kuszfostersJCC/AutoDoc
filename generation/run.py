@@ -83,7 +83,7 @@ def run_generation(
         generation.backends.base.DocGenerationError: backend failure.
         RuntimeError: every output format failed to write.
     """
-    # Imported lazily to keep app startup off the anthropic/whisper import cost,
+    # Imported lazily to keep app startup off the whisper/renderer import cost,
     # matching how the UI layer imported these before.
     from generation.generator import generate_documentation
     from generation.renderers import prepare_document, write_outputs
