@@ -37,21 +37,30 @@ setting reaches an existing install:
   * `scripts/make_release.py` deliberately strips `config.json` from the
     release zip, and `updater.py`'s apply step is a non-mirroring robocopy — so
     an update can NEVER write a deployed `config.json`. That is by design (it's
-    what stops an update eating someone's api_key or endpoint).
+    what stops an update eating a machine's endpoint or hotkey overrides).
   * But this file is CODE. It lands in `_internal/`, which is exactly what the
     update robocopy overwrites. And `load_config()` fills any key absent from
     config.json from the defaults here.
 
 So: a new key added here reaches every machine on the next "Check for Updates",
 carrying the value written here. That is the whole propagation mechanism, and
-it's why these defaults describe the real deployment (provider `local`, the
-district's AI server) rather than upstream-generic values.
+it's why these defaults describe the real deployment (the district's AI server)
+rather than upstream-generic values.
 
 **Its one hard limit:** defaults only fill keys that are ABSENT. Changing a
-value here does NOT change a machine whose config.json already has that key —
-which is correct for per-machine settings (api_key), and is also why moving the
-AI server off 172.20.28.203 still means visiting each machine or walking someone
-through the Settings tab. Deliberately not solved; see HANDOFF.md.
+value here does NOT change a machine whose config.json already has that key,
+which is why moving the AI server off 172.20.28.203 still means visiting each
+machine or walking someone through the Settings tab. Deliberately not solved;
+see HANDOFF.md.
+
+That limit is exactly why `local_api_key` (added 2026-08-06) is a field HERE
+with a real value, rather than a credential in its own file like the BookStack
+token: no deployed config.json has that key yet, so every existing install
+picks it up on the next "Check for Updates" and starts being metered correctly
+without anyone visiting a workstation. A separate file would have needed
+hand-placement on every machine — and until it arrived, those machines would
+have kept generating documentation perfectly while filing their tokens under
+the wrong application, which is a failure with no symptom.
 """
 
 import json
@@ -69,11 +78,6 @@ def get_app_dir() -> Path:
 
 @dataclass
 class AutoDocConfig:
-    # Empty default rather than a required field, so that every field is
-    # self-describing and default_config() needs no special case. Nothing
-    # constructs this without an api_key anyway (load_config always supplies
-    # one), and "" is what a local-provider install legitimately has.
-    api_key: str = ""
     whisper_model: str = "base"
     focus_radius_px: int = 200
     blur_strength: int = 15
@@ -100,29 +104,40 @@ class AutoDocConfig:
     stop_hotkey: str = "<ctrl>+<shift>+e"
     sessions_dir: str = "sessions"
     output_dir: str = "output"
-    claude_model: str = "claude-sonnet-5"
     max_screenshots_per_session: int = 100
     max_image_dimension: int = 1280
-    # Which backend generates documentation: "anthropic" (cloud) or "local"
-    # (any OpenAI-compatible local vision server — Ollama, LM Studio, etc.).
-    # See generation/backends/ for the implementations.
+    # ---------------------------------------------------------------- #
+    # The AI server. One backend, no provider switch (see               #
+    # generation/backends/__init__.py for why the Anthropic path was    #
+    # deleted rather than disabled on 2026-08-06).                      #
+    # ---------------------------------------------------------------- #
     #
-    # DEFAULTS TO THE REAL DEPLOYMENT (changed 2026-07-29 from "anthropic" +
-    # localhost:11434). Two reasons, and the second is the one that mattered:
-    #   * FERPA — narration and screenshots never leaving the district network
-    #     is the intended posture, so it should also be the default posture.
-    #   * A fresh/reimaged machine used to bootstrap to provider "anthropic"
-    #     with no key, i.e. a config that cannot generate documentation at all
-    #     until someone edits it. HANDOFF.md listed that as a standing reason
-    #     new machines still needed the USB stick. They now bootstrap to a
-    #     working config; the USB stick is only needed for models/base.pt and
-    #     the BookStack token.
-    # Side effect worth knowing: main.py's first-run API-key prompt only fires
-    # when provider == "anthropic", so a source checkout no longer nags for a
-    # key it wouldn't use.
-    provider: str = "local"
+    # MUST be port 8080 — the metering proxy. Port 8081 is the llama-server
+    # router: it answers requests correctly, which makes it a tempting fix
+    # when the proxy is down, but tokens sent there are invisible to every
+    # metric and dashboard on the server. LocalVisionBackend.endpoint_warnings()
+    # flags 8081 in the log and in the Settings tab; nothing blocks it, because
+    # it is a legitimate emergency fallback.
     local_endpoint: str = "http://172.20.28.203:8080/v1/chat/completions"
+    # Must match a model id the server actually serves. gemma4-e4b-fast is the
+    # server's default working model and the only one leaving real headroom on
+    # the 8 GB card. Only ONE model is resident at a time, so choosing a
+    # different one here means every AutoDoc generation may trigger a model
+    # swap — tens of seconds of cold start, and it evicts whatever the other
+    # applications were using. Don't change it without a reason.
     local_model: str = "gemma4-e4b-fast"
+    # THE METERING CREDENTIAL. This is not access control: the server accepts
+    # unkeyed requests and attributes them to `chat-ui`, so a blank value here
+    # produces perfectly good documentation while quietly folding AutoDoc's
+    # usage into aggregate staff chat and destroying the per-app record the
+    # whole metering stack exists to produce. There is no user-visible symptom;
+    # the backend logs a warning on every generation instead.
+    #
+    # Deliberately NOT modelled on the BookStack token (own file, not a config
+    # key). That pattern is right for a credential every install already has;
+    # this one is brand new, and a default here is the ONLY mechanism that
+    # reaches an already-deployed machine — see the module docstring.
+    local_api_key: str = "sk-nuPkxLzZ3YFETKOCwhvCXRPjdWB4Ip_J"
     # BookStack publishing (v1.3 — see PRD-v1.3-bookstack.md). Off by default.
     # The bot TOKEN is deliberately not here: this dataclass round-trips through
     # write_config() below, which rewrites config.json in full, so a credential

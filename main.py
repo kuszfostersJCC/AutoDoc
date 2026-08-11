@@ -6,15 +6,17 @@ Responsibilities:
    one is load-bearing for screenshot correctness, not just cosmetics).
 2. Create the QApplication, apply the theme, start the thread seam.
 3. Ensure config.json exists next to the executable.
-4. If the API key is blank AND we're running from source, prompt the user
-   once (admin/dev convenience only).
-5. Load the validated config and hand off to the TrayApp.
+4. Load the validated config and hand off to the TrayApp.
 
-Important: recording and transcription are fully local and need no API key
-or provider at all. Only "Generate Documentation" needs a working backend.
-A missing/invalid key must never block the app from launching — it should
-only surface as a friendly error at the moment someone actually clicks
-Generate (see generation/backends/ and sessions_window.py's error handling).
+There is no credential prompt at startup any more (removed 2026-08-06 with the
+Anthropic backend). The AI server's key ships as a config default, so a fresh
+install is already correctly configured; see config.py's module docstring.
+
+Important: recording and transcription are fully local and need no server at
+all. Only "Generate Documentation" talks to the AI server, and a misconfigured
+or unreachable server must never block the app from launching — it surfaces as
+a friendly error at the moment someone actually clicks Generate (see
+generation/backends/ and sessions_window.py's error handling).
 
 UI stack (2026-07-24): PySide6 / Qt Widgets. All styling is governed by
 pyside6-ui-style-guide.md and lives in theme/ — see theme/__init__.py.
@@ -28,7 +30,7 @@ import threading
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 import ui_service
 from config import default_config, get_app_dir, load_config
@@ -211,41 +213,12 @@ def _install_crash_visibility() -> None:
 # everything else and cannot disagree. Don't reintroduce a local copy.
 
 
-# ------------------------------------------------------------------ #
-# First-run setup (source/dev runs only)                               #
-# ------------------------------------------------------------------ #
-
-def _prompt_for_api_key() -> str | None:
-    """
-    Show a one-time dialog asking for the Anthropic API key.
-    Returns the entered key, or None if the user cancelled.
-
-    Only shown when running from source (not a packaged build) — this is
-    a developer/admin setup step, not something an end user should see.
-    Packaged builds should ship with a real key already in config.json;
-    if one isn't there, the app still launches fine (see main()) and
-    Generate Documentation will just show a friendly error until it is.
-
-    Requires QApplication to already exist (main() creates it before calling
-    this). Parent is None deliberately: no window exists this early.
-    """
-    QMessageBox.information(
-        None,
-        "AutoDoc — Setup",
-        "Welcome to AutoDoc!\n\n"
-        "To generate documentation, an Anthropic API key is required.\n"
-        "Please enter it below.",
-    )
-
-    key, ok = QInputDialog.getText(
-        None,
-        "AutoDoc — API Key",
-        "Paste your Anthropic API key (or leave blank to skip):",
-        QLineEdit.Password,
-    )
-    if not ok:
-        return None
-    return key.strip() or None
+# NOTE: `_prompt_for_api_key()` used to live here — a first-run dialog asking a
+# developer to paste an Anthropic key. Removed 2026-08-06 along with the
+# Anthropic backend. Don't reintroduce a credential prompt for the AI server:
+# its key is a metering label shipped as a config default, not a per-person
+# secret, and prompting for one would make a correctly-configured fresh install
+# look broken.
 
 
 # ------------------------------------------------------------------ #
@@ -270,13 +243,12 @@ def main() -> None:
     ui_service.init()        # thread seam; main thread only, after QApplication
 
     config_path = get_app_dir() / "config.json"
-    is_frozen = getattr(sys, "frozen", False)
 
     # Create config.json with defaults if it doesn't exist yet. Those defaults
-    # are the real deployment baseline (provider "local", the district AI
-    # server) — see config.py's module docstring — so a fresh or reimaged
-    # machine bootstraps to a config that actually works rather than to
-    # "anthropic with no key".
+    # are the real deployment baseline (the district AI server, endpoint, model
+    # and metering key) — see config.py's module docstring — so a fresh or
+    # reimaged machine bootstraps to a config that actually works, and works
+    # attributed to the right application.
     if not config_path.exists():
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(default_config(), f, indent=2)
@@ -290,33 +262,14 @@ def main() -> None:
     #
     # The position is bounded on both sides and both bounds are real:
     #   - it cannot move earlier, because `raw` doesn't exist yet;
-    #   - it cannot move later, because _prompt_for_api_key() below puts a
-    #     QMessageBox and a QInputDialog on screen, and load_config()'s failure
-    #     path raises a QMessageBox too. Theming after those means a source run
-    #     or a broken-config run shows its first dialogs unstyled — in dark mode
-    #     that's a bright white dialog in front of nothing.
+    #   - it cannot move later, because load_config()'s failure path raises a
+    #     QMessageBox. Theming after that means a broken-config run shows its
+    #     first dialog unstyled — in dark mode, a bright white dialog in front
+    #     of nothing.
     # Reads raw JSON rather than the AutoDocConfig, deliberately: a malformed
     # config must still produce a THEMED error dialog, and load_config() can't
     # be reached before that dialog exists.
     apply_theme(app, raw.get("theme"))   # Fusion + palette + app.qss + setFont
-
-    provider = (raw.get("provider") or "anthropic").strip().lower()
-
-    # Only prompt when running from source — an admin/dev setup convenience.
-    # Packaged builds NEVER block startup or nag an end user about missing
-    # credentials: recording and transcription are fully local and work with
-    # no key at all, and Generate Documentation fails gracefully in place
-    # (see sessions_window.py) if the backend isn't configured or the key is
-    # rejected. If you're seeing this prompt on a coworker's machine,
-    # config.json didn't get copied/filled in correctly when the app was
-    # packaged — check dist/AutoDoc/config.json.
-    if not is_frozen and provider == "anthropic" and not raw.get("api_key", "").strip():
-        key = _prompt_for_api_key()
-        if key:
-            raw["api_key"] = key
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(raw, f, indent=2)
-        # No key entered — proceed anyway. Recording/transcription still work.
 
     try:
         config = load_config()

@@ -12,8 +12,10 @@ VERSION constant — bump that first, don't pass it separately, or the shipped
 zip and the tag you create for it will disagree).
 
 WHY THIS EXCLUDES config.json, models/, sessions/, output/, exports/:
-Every install already has its own config.json (real api_key / local_endpoint
-— never meant to be public) and its own cached Whisper model, and possibly
+Every install already has its own config.json (the AI server's metering key /
+local_endpoint — never meant to be public, and the repo is public: this
+exclusion is the only thing keeping the doc-generator key out of a GitHub
+release asset) and its own cached Whisper model, and possibly
 its own recorded sessions if this dist/ folder has ever been run as a working
 install rather than a fresh build output. updater.py's apply step uses a
 PLAIN (non-mirroring) robocopy specifically so it only ever adds/overwrites

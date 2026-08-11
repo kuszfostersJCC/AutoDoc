@@ -3,9 +3,18 @@ sessions_window/settings_panel.py — the Settings tab inside the Sessions windo
 
 An interactive editor for the config.json values that plausibly change
 semi-regularly: recording hotkeys, the default screenshot display mode,
-documentation output formats, the AI backend, and the Whisper model.
-Deliberately NOT exposed here: api_key (sensitive — config.json only),
-directory paths and capture limits (IT-install decisions, not user settings).
+documentation output formats, the AI server, and the Whisper model.
+Deliberately NOT exposed here: `local_api_key`, directory paths and capture
+limits (IT-install decisions, not user settings).
+
+`local_api_key` is a special case worth stating plainly. It is not withheld
+because it is secret — it is the AI server's METERING label, and the server
+accepts requests without it, silently attributing them to `chat-ui`. It is
+withheld because no user has a reason to change it and a typo has no visible
+consequence: documentation still generates, and only the server's year-long
+per-app token record is wrong. So this panel REPORTS attribution status instead
+(the same treatment as the BookStack token, for the same reason — the failure
+mode is invisible) and leaves editing to config.json.
 
 PERSISTENCE MODEL: this panel mutates the SAME AutoDocConfig instance the whole
 app holds (TrayApp, Session, generation all share it), then persists via
@@ -76,7 +85,6 @@ log = logging.getLogger(__name__)
 _FORMAT_ORDER = ("docx", "html", "md")
 _FORMAT_LABELS = {"docx": "Word (.docx)", "html": "Web page (.html)", "md": "Markdown (.md)"}
 _WHISPER_MODELS = ("tiny", "base", "small")
-_PROVIDERS = ("anthropic", "local")
 # §3 requires sentence case in the UI; the config values are lowercase
 # internals. Keyed off THEMES so adding a palette can't leave a theme
 # unreachable from the dropdown with no error.
@@ -357,8 +365,8 @@ class SettingsPanel(QWidget):
 
         The bot TOKEN is deliberately absent — it isn't a config key at all (it
         would be wiped by the full-config rewrite on Save) and there's no masked
-        input anywhere in this app, matching the api_key rule in this module's
-        docstring. Instead the panel REPORTS token status, because the failure
+        input anywhere in this app, matching the local_api_key rule in this
+        module's docstring. Instead the panel REPORTS token status, because the failure
         mode without it is silent: publishing simply never happens, and the only
         evidence is a line in autodoc.log.
 
@@ -464,12 +472,18 @@ class SettingsPanel(QWidget):
             widget.setEnabled(on)
 
     def _build_backend_section(self) -> QFrame:
-        frame, lay = self._section("AI backend")
-        cfg = self.config_obj
+        """
+        The AI server.
 
-        self._provider_combo = QComboBox()
-        self._provider_combo.addItems(list(_PROVIDERS))
-        self._provider_combo.setCurrentText(cfg.provider)
+        There is no Provider dropdown any more (removed 2026-08-06 with the
+        Anthropic backend — see generation/backends/__init__.py). What replaced
+        it is a metering-status caption, which is a strictly better use of the
+        row: "which of two providers" was a question nobody asked, whereas "are
+        my requests being counted under the right application" is a question
+        with an invisible wrong answer.
+        """
+        frame, lay = self._section("AI server")
+        cfg = self.config_obj
 
         self._endpoint_edit = QLineEdit(cfg.local_endpoint)
         # Widths for these two live in app.qss (#settingsEndpoint /
@@ -502,27 +516,20 @@ class SettingsPanel(QWidget):
 
         form = self._form()
         form.addRow(
-            "Provider:",
-            self._field_with_help(
-                self._provider_combo,
-                "anthropic = Claude API (needs api_key in config.json) • "
-                "local = your own vision model.",
-            ),
-        )
-        form.addRow(
-            "Local endpoint:",
+            "Endpoint:",
             self._field_with_help(
                 self._endpoint_edit,
-                "OpenAI-compatible chat endpoint (Ollama, LM Studio…). "
-                "Used when provider = local.",
+                "The district AI server's chat endpoint. Must be port 8080 — "
+                "that is the metering proxy.",
             ),
         )
         form.addRow(
-            "Local model:",
+            "Model:",
             self._field_with_help(
                 model_row,
-                "Must match a model id on the endpoint. "
-                "Fetch queries the server's /v1/models.",
+                "Must match a model id on the server. Fetch queries /v1/models. "
+                "Only one model is resident at a time, so switching away from "
+                "the shared default makes every generation wait for a model swap.",
             ),
         )
         form.addRow(
@@ -534,7 +541,35 @@ class SettingsPanel(QWidget):
             ),
         )
         lay.addLayout(form)
+
+        self._metering_status = self._caption(self._metering_status_text())
+        lay.addWidget(self._metering_status)
         return frame
+
+    def _metering_status_text(self) -> str:
+        """
+        Report how this machine's requests will be counted on the AI server.
+
+        Both failure modes here are silent — a blank key and a port-8081
+        endpoint each generate documentation perfectly while making the usage
+        record wrong — so the Settings tab is the only place they can be seen
+        without reading autodoc.log or the Grafana dashboard.
+        """
+        from generation.backends.local_vision_backend import endpoint_warnings
+
+        cfg = self.config_obj
+        if (getattr(cfg, "local_api_key", "") or "").strip():
+            text = "Usage attributed to: doc-generator (API key present)."
+        else:
+            text = (
+                "Usage attributed to: chat-ui — NO API KEY. Documentation will "
+                "still generate, but this machine's tokens are being counted as "
+                "staff chat. Set local_api_key in config.json."
+            )
+        warnings = endpoint_warnings(self._endpoint_edit.text())
+        if warnings:
+            text += " " + " ".join(warnings)
+        return text
 
     def _build_updates_section(self) -> QFrame:
         frame, lay = self._section("Updates")
@@ -597,7 +632,6 @@ class SettingsPanel(QWidget):
             # overwrites it with the error.
             self._theme_combo,
             self._mode_combo,
-            self._provider_combo,
             self._whisper_combo,
             self._bs_doc_type,
             self._bs_owner,
@@ -624,17 +658,20 @@ class SettingsPanel(QWidget):
         support silently ignores every screenshot."""
         endpoint = self._endpoint_edit.text().strip()
         if not endpoint:
-            self._status.setText("Enter the local endpoint first, then Fetch.")
+            self._status.setText("Enter the endpoint first, then Fetch.")
             return
+        # Read on the UI thread, passed into the worker — never reach into
+        # self.config_obj from the thread.
+        api_key = getattr(self.config_obj, "local_api_key", "")
         self._fetch_btn.setEnabled(False)
         self._fetch_btn.setText("…")
-        self._status.setText("Querying the model server…")
+        self._status.setText("Querying the AI server…")
 
         def _work() -> None:
             try:
                 from generation.backends.local_vision_backend import list_models
 
-                models = list_models(endpoint)
+                models = list_models(endpoint, api_key=api_key)
                 ui_service.call_soon(lambda: self._on_models(models))
             except Exception as exc:
                 msg = str(exc)
@@ -709,10 +746,9 @@ class SettingsPanel(QWidget):
         if not formats:
             errors.append("Select at least one documentation output format.")
 
-        provider = self._provider_combo.currentText().strip().lower()
         endpoint = self._endpoint_edit.text().strip()
-        if provider == "local" and not endpoint:
-            errors.append("Provider 'local' needs a local endpoint URL.")
+        if not endpoint:
+            errors.append("The AI server endpoint cannot be blank.")
 
         bs_enabled = self._bs_enabled.isChecked()
         bs_book = self._bs_book.text().strip()
@@ -733,7 +769,6 @@ class SettingsPanel(QWidget):
         cfg.manual_capture_hotkey = self._manual_edit.text().strip()
         cfg.screenshot_mode = self._mode_combo.currentText()
         cfg.output_formats = formats
-        cfg.provider = provider
         cfg.local_endpoint = endpoint
         cfg.local_model = self._model_combo.currentText().strip()
         cfg.bookstack_enabled = bs_enabled
@@ -755,6 +790,11 @@ class SettingsPanel(QWidget):
         msg = "Settings saved."
         if restart_needed:
             msg += " Restart AutoDoc to load the new speech model."
+
+        # The endpoint may have just changed, and a port-8081 endpoint is a
+        # metering hole with no other symptom — recompute rather than leaving
+        # the caption describing the previous value.
+        self._metering_status.setText(self._metering_status_text())
 
         # Re-check on save rather than only at panel build: the token may have
         # been dropped in while this window was open.

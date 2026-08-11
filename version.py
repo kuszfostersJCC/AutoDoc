@@ -8,4 +8,4 @@ anything to offer. See scripts/make_release.py for the packaging step and
 HANDOFF.md for the full release process.
 """
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"

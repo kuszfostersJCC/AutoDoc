@@ -17,7 +17,12 @@
 # rebuild: `python main.py` from source.
 # ─────────────────────────────────────────────────────────────────────
 
-anthropic>=0.40.0
+# NOTE: `anthropic` was removed 2026-08-06 with the Claude API backend. The AI
+# server is spoken to over plain JSON/urllib from the stdlib, so documentation
+# generation now has NO third-party HTTP dependency at all. Dropping it also
+# drops httpx/anyio/charset_normalizer from the frozen build. Uninstall it from
+# an existing build venv (`pip uninstall anthropic`) before the next release
+# build — PyInstaller bundles what it finds, not what this file lists.
 mss>=9.0.2
 Pillow>=10.0.0
 pynput>=1.7.7
