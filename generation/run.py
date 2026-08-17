@@ -49,12 +49,36 @@ class GenerationResult:
     publish   — outcome of the BookStack step, or None if it never ran. Check
                 `.skipped` before reporting anything: skipped means publishing is
                 off or no token is present, which is not a failure.
+    truncated — the model stopped mid-document because it ran out of room. The
+                files WERE written and carry a banner saying so; publishing was
+                skipped. Callers should say so rather than showing a plain
+                "Saved:" — a truncated document is the one failure mode that
+                looks like success.
     """
 
     paths: list[Path]
     prepared: PreparedDocument
     session_data: dict
     publish: PublishResult | None = None
+    truncated: bool = False
+
+
+# Prefixed onto a partial document so the incompleteness travels WITH the file
+# instead of living only in a dialog someone dismissed. Deliberately plain
+# markdown that renderers.py's narrow parser already handles (H2 + paragraphs),
+# so it survives into .md, .html and .docx alike.
+_TRUNCATION_BANNER = """\
+## This document is INCOMPLETE
+
+The AI model ran out of room and stopped part-way through writing this
+procedure. The steps below are real, but the end of the process is missing — do
+not treat this as a finished SOP. Any screenshots the model never reached are
+collected under "Screen reference" at the bottom.
+
+To get a complete document: open the session in AutoDoc, delete screenshots that
+don't show a distinct step, and generate again.
+
+"""
 
 
 def run_generation(
@@ -85,6 +109,7 @@ def run_generation(
     """
     # Imported lazily to keep app startup off the whisper/renderer import cost,
     # matching how the UI layer imported these before.
+    from generation.backends.base import TruncatedGenerationError
     from generation.generator import generate_documentation
     from generation.renderers import prepare_document, write_outputs
 
@@ -94,11 +119,22 @@ def run_generation(
     with open(session_dir / "session.json", encoding="utf-8") as f:
         session_data = json.load(f)
 
-    markdown = generate_documentation(
-        config=config,
-        session_data=session_data,
-        session_dir=session_dir,
-    )
+    # A truncated generation is kept, not discarded: it cost minutes of GPU time
+    # and 18 of 25 steps is a usable starting point. What it must NOT do is look
+    # finished or reach the wiki — hence the banner and the publish skip below.
+    truncated = False
+    try:
+        markdown = generate_documentation(
+            config=config,
+            session_data=session_data,
+            session_dir=session_dir,
+        )
+    except TruncatedGenerationError as exc:
+        log.warning("run_generation: %s truncated — keeping partial, skipping publish",
+                    session_dir.name)
+        truncated = True
+        markdown = _TRUNCATION_BANNER + exc.partial_markdown
+
     prepared = prepare_document(
         markdown=markdown,
         session_data=session_data,
@@ -123,18 +159,31 @@ def run_generation(
     # never raises for exactly this reason: the files above cost real time and
     # tokens, and a wiki problem must not cost the user that work. Failures are
     # returned, logged, and recorded in session.json for retry.
-    publish = publish_session(
-        config=config,
-        session_dir=session_dir,
-        session_data=session_data,
-        prepared=prepared,
-    )
+    #
+    # A truncated document is the one thing that does NOT get published. The
+    # local files are worth keeping and finishing by hand; a half-written SOP on
+    # the wiki is worse than no page, because the next person to read it has no
+    # way to know it stops early. publish_existing() can push it later if the
+    # user decides the partial is good enough.
+    if truncated:
+        publish = PublishResult(
+            skipped=True,
+            reason="the generated document is incomplete (the model ran out of room)",
+        )
+    else:
+        publish = publish_session(
+            config=config,
+            session_dir=session_dir,
+            session_data=session_data,
+            prepared=prepared,
+        )
 
     return GenerationResult(
         paths=paths,
         prepared=prepared,
         session_data=session_data,
         publish=publish,
+        truncated=truncated,
     )
 
 

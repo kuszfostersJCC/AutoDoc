@@ -43,10 +43,40 @@ IMAGE FORMAT — the OpenAI-compatibility mess, handled adaptively:
   * Spec form (llama.cpp server, LM Studio, vLLM, most others):
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}
   * Ollama's documented form: the same but image_url is a BARE STRING.
-We send the spec form first; on an HTTP 4xx we retry ONCE with the bare-string
-form and log which one worked. The district server is llama.cpp (spec form), so
-the retry is dead weight there — it is kept because it costs one branch and
-makes a laptop-Ollama fallback work with the same config.
+We send the spec form first; on an HTTP 4xx that might be a format complaint we
+retry ONCE with the bare-string form and log which one worked. The district
+server is llama.cpp (spec form), so the retry is dead weight there — it is kept
+because it costs one branch and makes a laptop-Ollama fallback work with the
+same config.
+
+--------------------------------------------------------------------------
+NOT EVERY 4xx IS AN IMAGE-FORMAT PROBLEM (fixed 2026-08-13)
+--------------------------------------------------------------------------
+
+llama.cpp answers a prompt that exceeds the model's context window with an HTTP
+**400** — the same status an image-format complaint uses. Every 4xx used to be
+treated as retryable, so a 25-screenshot session that simply didn't fit would:
+
+  1. re-encode and re-upload every image in Ollama bare-string form,
+  2. fail again for the same reason, and
+  3. report "rejected in BOTH image formats … pick a vision-capable model in
+     Settings" — sending the user to change a model setting that was never the
+     problem, after paying for a second multi-megabyte upload and possibly
+     another cold start.
+
+A long recording is exactly where this fires, so the body is now classified
+BEFORE the retry decision: `_classify_http_error()` reads the server's error
+text, and a context/length complaint raises straight out with a message naming
+the real cause and the levers that actually help (fewer screenshots, or a bigger
+context window from IT). Only genuinely ambiguous 4xx bodies still earn the
+bare-string retry.
+
+Related, same root worry: the response's `finish_reason` is now checked.
+"length" means the model stopped mid-document because it ran out of room, which
+used to be invisible — `renderers._normalize_tokens()` appends every unplaced
+screenshot under a "Screen reference" heading, so a document truncated at step
+19 arrived looking like a complete document that merely had an image appendix.
+Silently wrong output is worse than a loud failure, so that now raises too.
 
 VISION SUPPORT IS NOT GUARANTEED: a GGUF without its vision projector (mmproj)
 reports input_modalities ["text"] and will ignore or reject image parts —
@@ -72,7 +102,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .base import DocGenerationError, GenerationBackend
+from .base import DocGenerationError, GenerationBackend, TruncatedGenerationError
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +120,35 @@ DEFAULT_TIMEOUT_S = 600
 # The models list is a cheap metadata call — it must never sit for minutes
 # behind a Fetch button.
 MODELS_TIMEOUT_S = 10
+
+# Fragments that appear in an OpenAI-compatible server's 400 body when the
+# request simply did not FIT, as opposed to being malformed. llama.cpp says
+# "the request exceeds the available context size — try increasing it"; vLLM
+# says "maximum context length"; LM Studio and Ollama each phrase it their own
+# way. Matched case-insensitively anywhere in the body.
+#
+# Deliberately biased toward false NEGATIVES: an unrecognised phrasing falls
+# through to the ambiguous path, which costs one wasted retry. Matching too
+# eagerly would instead suppress the bare-string image retry that makes an
+# Ollama fallback work at all, so a miss is much cheaper than a false hit.
+_CONTEXT_ERROR_MARKERS = (
+    "context size",
+    "context length",
+    "context window",
+    "context_length_exceeded",
+    "exceeds the available context",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "n_ctx",
+    "kv cache is full",
+)
+
+
+def _looks_like_context_overflow(detail: str) -> bool:
+    """True if a server error body reads like 'this did not fit', not 'this was malformed'."""
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in _CONTEXT_ERROR_MARKERS)
 
 
 def models_url_from_endpoint(endpoint: str) -> str:
@@ -241,11 +300,18 @@ class LocalVisionBackend(GenerationBackend):
                 log.info("local backend: bare-string image form accepted")
                 return result
             except _RetryableFormatError as second_error:
+                # Reaching here now means the server's error text matched NONE of
+                # the known "didn't fit" phrasings (see _classify_http_error), so
+                # a genuine payload/capability problem is the best remaining
+                # guess — but say "most likely", because an unrecognised
+                # context-overflow phrasing would also land here.
                 raise DocGenerationError(
-                    "The AI server rejected the request in BOTH image formats. If "
-                    "the selected model is text-only (no vision projector / mmproj), "
-                    "it cannot process screenshots — pick a vision-capable model in "
-                    "Settings.\n"
+                    "The AI server rejected the request in BOTH image formats.\n"
+                    "Most likely the selected model is text-only (no vision projector "
+                    "/ mmproj) and cannot process screenshots at all — pick a "
+                    "vision-capable model in Settings.\n"
+                    "If the model definitely does support images, the server's own "
+                    "error text below is the thing to read.\n"
                     f"First attempt: {first_error}\nSecond attempt: {second_error}"
                 ) from second_error
 
@@ -300,34 +366,46 @@ class LocalVisionBackend(GenerationBackend):
                     usage.get("completion_tokens"),
                 )
 
-            return body["choices"][0]["message"]["content"]
+            choice = body["choices"][0]
+            content = choice["message"]["content"]
+
+            # finish_reason "length" means the model stopped because it ran out
+            # of room, NOT because the document was done. This has to be caught
+            # here: renderers._normalize_tokens() appends every screenshot the
+            # model never placed under a "Screen reference" heading, so a
+            # document that stops at step 19 of 25 arrives looking like a
+            # finished document with an image appendix. Nothing downstream can
+            # tell the difference, and nobody proofreads a document that looks
+            # complete.
+            #
+            # Raise-with-the-partial rather than raise-or-return: see
+            # TruncatedGenerationError in base.py for why the work is kept.
+            finish_reason = choice.get("finish_reason")
+            if finish_reason == "length":
+                log.warning(
+                    "local backend: generation TRUNCATED (finish_reason=length) "
+                    "after %s completion tokens",
+                    usage.get("completion_tokens", "?"),
+                )
+                raise TruncatedGenerationError(
+                    "The model ran out of room and stopped part-way through the "
+                    "document.\n"
+                    "AutoDoc kept what it produced and marked it incomplete, but it "
+                    "did NOT publish it to the wiki.\n"
+                    "What helps, in order of effort:\n"
+                    "  • Open the session in the editor and delete screenshots that "
+                    "don't show a distinct step — images cost far more of the "
+                    "model's room than the narration does.\n"
+                    "  • Split a long procedure into two recordings.\n"
+                    f"  • Ask IT whether '{self.model}' can be served with a larger "
+                    "context window.",
+                    partial_markdown=content,
+                )
+            return content
 
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code in (401, 403):
-                # The proxy currently lets unkeyed requests through, so this
-                # means a key was sent and REJECTED — a stale key after a
-                # rotation, not a missing one. Say so precisely; "check your
-                # key" sends people to look at a field that is populated.
-                raise DocGenerationError(
-                    f"The AI server rejected AutoDoc's API key (HTTP {exc.code}).\n"
-                    "The key was probably rotated on the server. Ask IT for the "
-                    "current 'doc-generator' key and update local_api_key in "
-                    "config.json.\n"
-                    f"Detail: {detail}"
-                ) from exc
-            if 400 <= exc.code < 500:
-                # Might be the image-format incompatibility — let generate()
-                # decide whether a retry in the other form makes sense.
-                raise _RetryableFormatError(
-                    f"AI server at {self.endpoint} returned HTTP {exc.code}.\n"
-                    f"Detail: {detail}",
-                    http_code=exc.code,
-                ) from exc
-            raise DocGenerationError(
-                f"AI server at {self.endpoint} returned HTTP {exc.code}.\n"
-                f"Detail: {detail}"
-            ) from exc
+            raise self._classify_http_error(exc.code, detail, content_blocks) from exc
         except urllib.error.URLError as exc:
             raise DocGenerationError(
                 f"Could not reach the AI server at {self.endpoint}.\n"
@@ -357,6 +435,82 @@ class LocalVisionBackend(GenerationBackend):
                 f"Could not generate documentation using the AI server.\n"
                 f"Detail: {exc}"
             ) from exc
+
+    def _classify_http_error(self, code: int, detail: str, content_blocks: list[dict]) -> Exception:
+        """
+        Decide which exception an HTTP error from the server deserves.
+
+        RETURNS the exception rather than raising it, so the call site keeps its
+        `raise ... from exc` chaining.
+
+        The consequential distinction is `_RetryableFormatError` vs everything
+        else: returning it means "this might be the image-payload dialect, try
+        the other one", and that retry re-uploads every screenshot in the
+        session. So anything we can positively identify must not return it. See
+        the module docstring for the context-overflow case that used to.
+        """
+        if code in (401, 403):
+            # The proxy currently lets unkeyed requests through, so this means a
+            # key was sent and REJECTED — a stale key after a rotation, not a
+            # missing one. Say so precisely; "check your key" sends people to
+            # look at a field that is populated.
+            return DocGenerationError(
+                f"The AI server rejected AutoDoc's API key (HTTP {code}).\n"
+                "The key was probably rotated on the server. Ask IT for the "
+                "current 'doc-generator' key and update local_api_key in "
+                "config.json.\n"
+                f"Detail: {detail}"
+            )
+
+        image_count = sum(1 for b in content_blocks if b["type"] == "image")
+
+        if code == 413:
+            # A transport limit, not a model limit — nginx's client_max_body_size
+            # in front of the proxy is the usual culprit. Same first-line fix as
+            # a context overflow (send fewer images), different thing for IT to
+            # change, so don't conflate the two in the message.
+            return DocGenerationError(
+                "The AI server refused the request as too large to accept at all "
+                f"(HTTP 413), before the model saw it.\n"
+                f"AutoDoc sent {image_count} screenshot(s) as one upload.\n"
+                "Removing screenshots in the session editor will get you under the "
+                "limit; the durable fix is for IT to raise the upload body limit on "
+                "the proxy in front of the AI server.\n"
+                f"Server detail: {detail}"
+            )
+
+        if 400 <= code < 500 and _looks_like_context_overflow(detail):
+            # Identified: too much content for the window. A bare-string retry
+            # would re-upload every screenshot only to fail identically, and the
+            # old code then blamed the model's vision support.
+            return DocGenerationError(
+                "This session is too large for the model's context window "
+                f"(HTTP {code}).\n"
+                f"It was sent with {image_count} screenshot(s), and each screenshot "
+                "costs far more of the window than the narration does.\n"
+                "What helps, in order of effort:\n"
+                "  • Open the session in the editor and delete screenshots that "
+                "don't show a distinct step.\n"
+                "  • Split a long procedure into two recordings.\n"
+                f"  • Ask IT whether '{self.model}' can be served with a larger "
+                "context window — and whether the server is dividing its context "
+                "across parallel slots, which cuts what any one request can use.\n"
+                f"Server detail: {detail}"
+            )
+
+        if 400 <= code < 500:
+            # Unidentified 4xx. MIGHT be the image-format incompatibility — let
+            # generate() decide whether a retry in the other form makes sense.
+            return _RetryableFormatError(
+                f"AI server at {self.endpoint} returned HTTP {code}.\n"
+                f"Detail: {detail}",
+                http_code=code,
+            )
+
+        return DocGenerationError(
+            f"AI server at {self.endpoint} returned HTTP {code}.\n"
+            f"Detail: {detail}"
+        )
 
     @staticmethod
     def _to_openai_content(content_blocks: list[dict], bare_image_strings: bool) -> list[dict]:

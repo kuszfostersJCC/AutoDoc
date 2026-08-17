@@ -11,7 +11,7 @@ TWO THINGS THAT MUST NOT DRIFT:
    is downscaled to fit the screen, so every rectangle the user drags must be
    divided by that scale ratio before being appended to
    `event["data"]["redact_regions"]`. Store display coordinates by mistake and
-   the redaction lands in the wrong place at export time — on a smaller area
+   the redaction lands in the wrong place when rendered — on a smaller area
    than intended, i.e. it silently fails to cover the sensitive data while
    still looking correct in this dialog. The raw PNG on disk is never modified;
    `recorder/screenshot.py::apply_redactions()` applies these regions at every
@@ -167,7 +167,8 @@ class RedactionDialog(QDialog):
 
         hint = QLabel(
             "Drag on the image to pixelate sensitive areas (student data, IDs, "
-            "emails). Changes apply to previews, exports, and generated documents."
+            "emails). Changes apply to previews, generated documents, and anything "
+            "published to the wiki."
         )
         hint.setProperty("role", "caption")
         hint.setWordWrap(True)

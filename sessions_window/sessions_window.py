@@ -6,7 +6,19 @@ A window listing all saved sessions. From here the user can:
   • Generate documentation — sends the session to the configured backend
   • Retranscribe — re-runs Whisper on the saved audio (recovery path for
     sessions whose transcription failed or timed out)
-  • Record more / Export / Delete
+  • Record more / Delete
+
+There is no Export button. It produced an INSTRUCTIONS.md + images zip for
+someone to upload into Claude Desktop, which stopped making sense when the
+Anthropic backend was deleted on 2026-08-06: AutoDoc now talks only to the
+district's on-premises server, and a feature whose whole purpose was handing
+session content to an outside service contradicted that. It also carried a
+second, silently diverged copy of the generation prompt (no ground-truth element
+names, no screenshot-placement protocol), so the handoff produced worse
+documentation than pressing Generate — for reasons nobody would have guessed.
+Removed 2026-08-13 along with generation/exporter.py. The workflow it served
+("coworker records, admin generates") now needs a configured install rather than
+a zip; that is a deliberate loss, not an oversight.
 
 THREADING MODEL (do not regress — see ui_service.py for the full story):
 Widgets may only be touched from the Qt main thread. open_sessions_window()
@@ -378,10 +390,6 @@ class SessionsWindow(QMainWindow):
         record_more_btn.clicked.connect(self._record_more)
         bar.addWidget(record_more_btn)
 
-        export_btn = QPushButton("Export")
-        export_btn.clicked.connect(self._export)
-        bar.addWidget(export_btn)
-
         # Retry a failed push without paying for generation again. Lives here
         # rather than in the editor because it operates on the selected session
         # like every other button on this bar, and it needs no session content —
@@ -521,7 +529,10 @@ class SessionsWindow(QMainWindow):
             )
             primary = result.paths[0]
             publish = result.publish
-            ui_service.call_soon(lambda: self._on_generated(primary, publish))
+            truncated = result.truncated
+            ui_service.call_soon(
+                lambda: self._on_generated(primary, publish, truncated)
+            )
         except Exception as exc:
             log.exception("_do_generate: generation failed")
             msg = str(exc)
@@ -613,7 +624,7 @@ class SessionsWindow(QMainWindow):
         self._gen_btn.setEnabled(True)
         self._gen_btn.setText("Generate documentation")
 
-    def _on_generated(self, output_path: Path, publish=None) -> None:
+    def _on_generated(self, output_path: Path, publish=None, truncated: bool = False) -> None:
         """
         Report a finished generation, INCLUDING the automatic publish outcome.
 
@@ -623,9 +634,36 @@ class SessionsWindow(QMainWindow):
         the same error looked like it "only happened" when the manual Publish
         button was used (field report 2026-07-27). A step that can fail silently
         will be assumed to have worked.
+
+        The same argument applies to `truncated`, and more sharply: a document
+        that stops at step 19 of 25 is the only failure mode that arrives looking
+        like a success. It is reported FIRST and it returns early — the file was
+        written and is worth opening, but nothing about a publish matters when the
+        document isn't finished (generation/run.py deliberately skipped it).
         """
         self._reset_gen_button()
         self._set_status(f"Saved: {output_path.name}")
+
+        if truncated:
+            self._set_status(f"Saved: {output_path.name} — INCOMPLETE")
+            QMessageBox.warning(
+                self,
+                "AutoDoc — Document is incomplete",
+                "The AI model ran out of room and stopped part-way through this "
+                "document.\n\n"
+                "It was still saved, and it starts with a note saying it is "
+                "incomplete — but the end of the procedure is missing, so don't "
+                "hand it to anyone as-is. It was NOT published to BookStack.\n\n"
+                "To get a complete document: open the session, delete screenshots "
+                "that don't show a distinct step, and generate again. Screenshots "
+                "use up far more of the model's room than the narration does.",
+            )
+            if self._confirm(
+                "AutoDoc — Incomplete document saved",
+                f"Open the partial document anyway?\n\n{output_path}",
+            ):
+                self._reveal(output_path)
+            return
 
         # A skipped publish (turned off, or no token) is not news — say nothing.
         if publish is not None and not publish.skipped and not publish.ok:
@@ -739,9 +777,13 @@ class SessionsWindow(QMainWindow):
             events.extend(segments)
             data["events"] = sorted(events, key=lambda e: e.get("timestamp_offset_ms", 0))
             data["status"] = "ready"
-            # A stale manual edit would silently override the new transcript
-            # at generation time (edited_full_transcript takes precedence) —
-            # remove it; the user confirmed this in the dialog above.
+            # Every manual transcript edit is discarded here, and that is the
+            # point — the user confirmed it in the dialog above. Per-segment
+            # edits (`edited_text`) go automatically, because the segment events
+            # carrying them were just dropped and replaced. The blob has to be
+            # popped explicitly, since it lives on the session rather than on an
+            # event and would otherwise silently override the new transcript at
+            # generation time.
             data.pop("edited_full_transcript", None)
 
             tmp = json_path.with_suffix(".json.tmp")
@@ -815,43 +857,8 @@ class SessionsWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------ #
-    # Export / Delete / Misc                                               #
+    # Delete / Misc                                                        #
     # ------------------------------------------------------------------ #
-
-    def _export(self) -> None:
-        """Export the selected session as a self-contained Claude-ready folder."""
-        session = self._selected_session()
-        if not session:
-            return
-
-        json_path = session["session_dir"] / "session.json"
-        try:
-            with open(json_path, encoding="utf-8") as f:
-                session_data = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            QMessageBox.critical(self, "AutoDoc", f"Could not read session:\n{exc}")
-            return
-
-        from generation.exporter import export_session, zip_export_folder
-
-        exports_root = get_app_dir() / "exports"
-        try:
-            export_dir = export_session(
-                session_data, session["session_dir"], exports_root, config=self.config
-            )
-            zip_path = zip_export_folder(export_dir)
-        except Exception as exc:
-            log.exception("_export: failed")
-            QMessageBox.critical(self, "AutoDoc — Export failed", f"Export error:\n{exc}")
-            return
-
-        self._set_status(f"Exported: {zip_path.name}")
-
-        if self._confirm(
-            "AutoDoc — Exported",
-            f"Session exported to:\n{zip_path}\n\nOpen the folder containing the zip now?",
-        ):
-            self._reveal(zip_path)
 
     def _delete(self) -> None:
         session = self._selected_session()

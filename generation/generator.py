@@ -35,7 +35,12 @@ def generate_documentation(
             (bad credentials, unreachable server, malformed response, etc.).
     """
     content_blocks = build_content_blocks(session_data, session_dir, config)
-    if not content_blocks:
+    # build_content_blocks() always emits the session preamble first, so
+    # `if not content_blocks` stopped being an emptiness test the moment that was
+    # added. Exactly one block means the preamble and nothing else — no narration
+    # and no readable screenshots — and generating from that would invent a
+    # procedure out of a session name and a duration.
+    if len(content_blocks) <= 1:
         raise ValueError(
             "No usable content found in this session.\n"
             "The session may have no transcript and no screenshots."

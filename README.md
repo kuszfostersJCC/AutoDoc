@@ -121,7 +121,7 @@ is missing from your checkout, that is correct.
 | `config.json` | Live config, including the AI server's API key | `copy config.example.json config.json` |
 | `bookstack.token` | BookStack bot credential | From the maintainer; only needed for publishing |
 | `models/base.pt` | Whisper weights, ~150 MB | Downloaded automatically on first run |
-| `sessions/`, `output/`, `exports/` | Recorded sessions and generated documents | Created at runtime. May contain student data — never commit. |
+| `sessions/`, `output/` | Recorded sessions and generated documents | Created at runtime. May contain student data — never commit. |
 | `dist/`, `build/`, `releases/` | Build output and packaged zips | Produced by `pyinstaller autodoc.spec` and `scripts/make_release.py` |
 | `venv/` | Virtual environment | Created during setup |
 
@@ -220,11 +220,21 @@ server" first.
 ## Building and releasing
 
 ```bash
+git status                      # must be clean — see the warning below
 pyinstaller autodoc.spec        # -> dist/AutoDoc/  (onedir, not onefile)
 python scripts/make_release.py  # -> releases/AutoDoc-v<version>.zip
 ```
 
-The build prints what it is shipping and warns about the known foot-guns —
+`make_release.py` prints the remaining steps (merge, tag, publish) — follow that
+output rather than working from memory.
+
+**The release zip is built from your working tree, not from git.** Nothing in the
+pipeline consults a commit, so a release can contain uncommitted code that exists
+nowhere in history and no tooling will notice. `git status` before you build is
+the only safeguard. The upside of the same property: a branch or tag mistake
+can't ship broken code to users, because the bytes come from the local build.
+
+The build also prints what it is shipping and warns about the known foot-guns —
 **read that output before handing out a build.** Bump `version.py` and tag the
 matching commit together; `updater.py` compares the two and will silently
 disagree with reality if they drift. Full process, including the file-lock

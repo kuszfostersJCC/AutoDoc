@@ -22,9 +22,19 @@ SCREENSHOT PANEL VISIBILITY:
   HANDOFF.md.
 
 TRANSCRIPT STORAGE:
-  The edited text is stored as "edited_full_transcript" in session.json. When
-  present, the generation backend uses it in place of the individual Whisper
-  segments — which is also why Retranscribe and Record More delete that key.
+  Edits are written back onto the INDIVIDUAL Whisper segments (each segment's
+  "edited_text") whenever the paragraph count still matches, so the narration
+  keeps its timestamps and generation can go on interleaving it with the
+  screenshots taken at those moments. Only a genuine restructure — paragraphs
+  merged, split, or emptied — falls back to the old single
+  "edited_full_transcript" blob, which has no timestamps.
+
+  Both the populate and the save side live in recorder/transcript.py; read its
+  module docstring before touching either. The short version: this editor used
+  to write the blob UNCONDITIONALLY, so opening the window and pressing Save
+  with no edits at all was enough to destroy the timeline for that session.
+  Retranscribe and Record More still drop the blob, and now also drop the
+  segments it was derived from.
 
 SCREENSHOT RENDERING:
   Screenshots are stored RAW on disk (recorder/screenshot.py). The mode chosen
@@ -84,6 +94,7 @@ from recorder.screenshot import (
     render_event_image,
     resolve_render_mode,
 )
+from recorder.transcript import apply_transcript_edit, editable_transcript
 from sessions_window.image_bridge import pil_to_qpixmap
 from sessions_window.redaction_dialog import RedactionDialog
 from sessions_window.thumb_card import ThumbCard
@@ -331,9 +342,16 @@ class SessionEditorWindow(QMainWindow):
                 "This session predates editable screenshot effects — its images were "
                 "blurred permanently at capture, so the display mode cannot be changed."
             )
+        # No "remove the stop-click frames" tip: stop_hotkey (ctrl+shift+e)
+        # exists precisely so ending a recording doesn't get captured as a
+        # click, so for anyone using it that advice invents a manual cleanup
+        # step that isn't needed. Deleting redundant frames is still worth
+        # doing — it's the first lever when a session won't fit the model's
+        # context window — so say that instead.
         return (
             "Click a screenshot to enlarge it and pixelate sensitive areas. "
-            "Tip: remove the last few stop-click frames."
+            "Deleting frames that don't show a distinct step makes the "
+            "generated document better, and shorter to produce."
         )
 
     # ------------------------------------------------------------------ #
@@ -341,19 +359,11 @@ class SessionEditorWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _populate(self) -> None:
-        events = self.session_data.get("events", [])
-
-        if "edited_full_transcript" in self.session_data:
-            transcript_text = self.session_data["edited_full_transcript"]
-        else:
-            segments = sorted(
-                [e for e in events if e.get("type") == "transcript_segment"],
-                key=lambda e: e["timestamp_offset_ms"],
-            )
-            transcript_text = "\n\n".join(
-                (e.get("edited_text") or e["data"]["text"]).strip() for e in segments
-            )
-        self.transcript_box.setPlainText(transcript_text)
+        # editable_transcript() owns the blob-vs-segments precedence, and its
+        # join separator is the same one _save() splits on — that round trip is
+        # what lets a word-level fix stay a per-segment edit instead of
+        # collapsing the timeline into a blob.
+        self.transcript_box.setPlainText(editable_transcript(self.session_data))
 
         self._rebuild_thumbnails()
 
@@ -530,7 +540,8 @@ class SessionEditorWindow(QMainWindow):
         """
         Persist edits to session.json. Returns True on success.
         - Removes deleted screenshot events (and their PNG files).
-        - Stores the edited transcript as edited_full_transcript.
+        - Writes the transcript back onto the individual segments when the
+          paragraph count still matches, else as an edited_full_transcript blob.
         - Stores the chosen screenshot render mode.
         """
         edited_text = self.transcript_box.toPlainText().strip()
@@ -548,7 +559,16 @@ class SessionEditorWindow(QMainWindow):
                 kept_events.append(evt)
 
         self.session_data["events"] = kept_events
-        self.session_data["edited_full_transcript"] = edited_text
+
+        # Must run AFTER events are reassigned: it walks the segment events on
+        # session_data to decide whether the edit maps onto them.
+        mapped = apply_transcript_edit(self.session_data, edited_text)
+        log.info(
+            "session_editor: transcript saved %s",
+            "per-segment (timeline kept)" if mapped
+            else "as a full-transcript blob (paragraph count changed)",
+        )
+
         if not self._all_legacy:
             self.session_data["screenshot_render_mode"] = self._render_mode
         self._screenshot_events = [

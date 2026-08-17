@@ -12,24 +12,34 @@ VERSION constant — bump that first, don't pass it separately, or the shipped
 zip and the tag you create for it will disagree).
 
 WHY THIS EXCLUDES config.json, models/, sessions/, output/, exports/:
-Every install already has its own config.json (the AI server's metering key /
-local_endpoint — never meant to be public, and the repo is public: this
-exclusion is the only thing keeping the doc-generator key out of a GitHub
-release asset) and its own cached Whisper model, and possibly
-its own recorded sessions if this dist/ folder has ever been run as a working
-install rather than a fresh build output. updater.py's apply step uses a
-PLAIN (non-mirroring) robocopy specifically so it only ever adds/overwrites
-files present in the release zip — leaving those paths out here is what
-makes that safe. If any of this ends up in a public release asset, it can't
-be un-published from GitHub after the fact, so this list is deliberately
-generous rather than minimal.
+Every install has its own config.json with its own per-machine values, its own
+cached Whisper model, and possibly its own recorded sessions if this dist/ folder
+has ever been run as a working install rather than a fresh build output.
+updater.py's apply step uses a PLAIN (non-mirroring) robocopy specifically so it
+only ever adds/overwrites files present in the release zip — leaving those paths
+out here is what keeps an update from clobbering any of it.
 
-After this script runs:
-    1. git tag v<version> && git push origin v<version>
-    2. gh release create v<version> releases/AutoDoc-v<version>.zip \\
-           --title "v<version>" --notes "<what changed, for users to read>"
-       (or do the same by hand: GitHub -> Releases -> Draft a new release ->
-       attach the zip, same tag)
+`sessions/`, `output/` and `exports/` are the ones that genuinely must never
+escape: they can contain student data, and a public release asset cannot be
+un-published from GitHub after the fact. This list is deliberately generous
+rather than minimal for that reason. config.json is excluded to protect
+per-machine settings, NOT to hide the AI server's metering key — that key ships
+in config.py's defaults by design (see HANDOFF.md, "The key is in the public repo
+on purpose").
+
+THIS SCRIPT ZIPS THE WORKING TREE'S BUILD OUTPUT. GIT IS NEVER CONSULTED.
+Two consequences, and the second one bites:
+
+  * A branch or tag mistake cannot ship wrong code to users — the bytes come
+    from whatever `pyinstaller` last built locally. (v1.3.2 was tagged on `dev`
+    without merging to `main`; users were unaffected. See HANDOFF.md.)
+  * The zip therefore reflects UNCOMMITTED edits too. A release can contain code
+    that exists in no commit anywhere, and nothing here can detect that. Run
+    `git status` before `pyinstaller` — that is the only safeguard.
+
+The "Next steps" this prints deliberately includes the merge to `main`, because
+this output is the checklist that actually gets followed, and the merge is the
+step that got skipped when it lived only in HANDOFF.md.
 """
 
 import sys
@@ -85,8 +95,19 @@ def main() -> None:
         print(f"Excluded files: {', '.join(skipped_files)}")
     print()
     print("Next steps:")
-    print(f"  git tag v{VERSION} && git push origin v{VERSION}")
-    print(f'  gh release create v{VERSION} "{zip_path}" --title "v{VERSION}" --notes "..."')
+    print("  0. Confirm this zip matches a commit — `git status` should be clean.")
+    print("     This zip came from dist/, not from git; uncommitted edits are IN it.")
+    print("  1. Merge dev -> main, and tag the resulting main commit.")
+    print("     Skipping this doesn't affect users, but it leaves main (and the")
+    print("     README that GitHub shows) behind what's deployed. See HANDOFF.md,")
+    print("     'Release process'.")
+    print(f"  2. git tag v{VERSION} && git push origin v{VERSION}")
+    print(
+        f'  3. gh release create v{VERSION} "{zip_path}" '
+        f'--title "v{VERSION}" --notes "..."'
+    )
+    print("     Notes are what the in-app update dialog shows users — write them")
+    print("     for a non-technical reader.")
 
 
 if __name__ == "__main__":

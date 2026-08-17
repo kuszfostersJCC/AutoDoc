@@ -13,10 +13,33 @@ tokens of the form `{{screenshot:evt_0004}}` on their own line. This module:
     "Screen reference" heading, so images are never silently lost — an
     imperfect model degrades to "all images at the end", not "no images".
 
-The markdown→HTML/docx conversion is deliberately NOT a general markdown
-engine. The prompt mandates a narrow structure (H1/H2/H3 headings, paragraphs,
-"- " bullet lists, **bold**) and that is all this parses. If the prompt's
-output format changes, update _iter_blocks() to match.
+--------------------------------------------------------------------------
+THE PARSER AND THE PROMPT ARE ONE CONTRACT — CHANGE THEM TOGETHER
+--------------------------------------------------------------------------
+
+The markdown→HTML/docx conversion is deliberately NOT a general markdown engine.
+It understands exactly what the prompt in generation/content.py permits:
+
+    headings (H1–H4), paragraphs, bulleted lists (nested), numbered lists
+    (nested), pipe tables with a header row, **bold**, *italic*, `inline code`,
+    and whole-line {{screenshot:id}} tokens.
+
+and nothing else. Fenced code blocks, block quotes, horizontal rules,
+underscore emphasis and raw HTML are NOT parsed, which is why the prompt names
+them and tells the model not to emit them.
+
+**Keep those two lists in step.** Widening the prompt without widening
+_iter_blocks() is the one strictly-bad combination: an unparsed construct is not
+dropped, it is passed through as a paragraph, so a table the renderer doesn't
+understand reaches the reader as a row of literal pipe characters in a Word
+document. That is exactly why nested lists and tables were added here FIRST
+(2026-08-13) and the prompt loosened afterwards, rather than the other way round.
+
+BookStack is not affected by any of this and never was: publish/ sends
+`prepared.doc` as markdown and BookStack renders it server-side, so richer
+markdown always worked there. The local md/html/docx writers were the only
+bottleneck — worth remembering if output ever looks better on the wiki than in
+the Word file.
 
 PUBLIC API — two steps, deliberately separate:
 
@@ -267,39 +290,254 @@ def _hoist_inline_tokens(doc: str) -> str:
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------ #
+# Block parsing                                                        #
+# ------------------------------------------------------------------ #
+
+# A bullet needs whitespace AFTER the marker, which is what keeps a line
+# starting "**Note**" from being read as a list item.
+_UL_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*+][ \t]+(?P<text>.*)$")
+_OL_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)\d{1,3}[.)][ \t]+(?P<text>.*)$")
+# Horizontal rules and setext underlines. Dropped rather than rendered: the
+# prompt asks the model not to emit them, and a literal row of dashes in a Word
+# document is worse than a missing separator. A setext "Title\n-----" therefore
+# degrades to a plain paragraph, which is the right trade for output that is
+# supposed to use ATX headings.
+_RULE_RE = re.compile(r"^[-*_=]{3,}$")
+
+
+def _indent_width(indent: str) -> int:
+    """Tabs count as 4. Only relative order matters — see _assign_levels."""
+    return len(indent.replace("\t", "    "))
+
+
+def _match_list_item(raw_line: str) -> dict | None:
+    """A list item as {"indent": int, "ordered": bool, "text": str}, or None."""
+    for regex, ordered in ((_UL_ITEM_RE, False), (_OL_ITEM_RE, True)):
+        match = regex.match(raw_line)
+        if match:
+            return {
+                "indent": _indent_width(match.group("indent")),
+                "ordered": ordered,
+                "text": match.group("text").strip(),
+            }
+    return None
+
+
+def _assign_levels(items: list[dict]) -> list[dict]:
+    """
+    Turn raw indent widths into 0-based nesting levels with an indent stack.
+
+    Width-agnostic on purpose. Models are wildly inconsistent about whether a
+    sublist is indented 2, 3 or 4 spaces, and mix widths inside one list; all
+    that is treated as meaningful is whether an item is indented MORE than the
+    one above it. So 2-space and 4-space nesting both come out as level 1, and a
+    ragged list still nests the way it looks.
+    """
+    stack: list[int] = []
+    out: list[dict] = []
+    for item in items:
+        indent = item["indent"]
+        while stack and indent < stack[-1]:
+            stack.pop()
+        if not stack or indent > stack[-1]:
+            stack.append(indent)
+        out.append({
+            "level": len(stack) - 1,
+            "ordered": item["ordered"],
+            "text": item["text"],
+        })
+    return out
+
+
+def _is_table_delimiter(line: str) -> bool:
+    """
+    True for a pipe-table separator row like `|---|:--:|`.
+
+    Requiring a pipe is what distinguishes it from a horizontal rule, and
+    requiring a dash is what distinguishes it from an ordinary short row.
+    """
+    stripped = line.strip()
+    if "|" not in stripped or "-" not in stripped:
+        return False
+    return all(char in "|-: \t" for char in stripped)
+
+
+def _split_row(line: str) -> list[str]:
+    """Split one pipe-table row, tolerating missing outer pipes."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _parse_alignments(delimiter: str, width: int) -> list[str | None]:
+    """Column alignments from the separator row: `:--`, `:-:`, `--:`."""
+    aligns: list[str | None] = []
+    for cell in _split_row(delimiter):
+        left, right = cell.startswith(":"), cell.endswith(":")
+        aligns.append(
+            "center" if left and right else "right" if right else "left" if left else None
+        )
+    return (aligns + [None] * width)[:width]
+
+
+def _try_parse_table(lines: list[str], start: int) -> tuple[dict, int] | None:
+    """
+    Parse a pipe table beginning at `start`, or None.
+
+    Returns (block, lines_consumed). The separator row is REQUIRED — without it
+    an ordinary sentence containing a pipe would be swallowed as a one-row table.
+    Ragged rows are padded and over-long rows truncated to the header's width, so
+    a model that miscounts cells still produces a readable table instead of an
+    exception inside the docx writer.
+    """
+    if start + 1 >= len(lines):
+        return None
+    header_line = lines[start].strip()
+    if "|" not in header_line or not _is_table_delimiter(lines[start + 1]):
+        return None
+
+    header = _split_row(header_line)
+    aligns = _parse_alignments(lines[start + 1], len(header))
+
+    rows: list[list[str]] = []
+    index = start + 2
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not stripped or "|" not in stripped:
+            break
+        cells = _split_row(stripped)
+        rows.append((cells + [""] * len(header))[: len(header)])
+        index += 1
+
+    return {"header": header, "align": aligns, "rows": rows}, index - start
+
+
+def _next_content_is_list_item(lines: list[str], start: int) -> bool:
+    """Looking past blank lines, is the next real line another list item?"""
+    for line in lines[start:]:
+        if line.strip():
+            return _match_list_item(line) is not None
+    return False
+
+
 def _iter_blocks(doc: str):
     """
-    Yield (kind, payload) blocks from the constrained markdown:
-      ("heading", (level, text)) | ("bullets", [items]) | ("image", event_id)
-      | ("para", text)
+    Yield (kind, payload) blocks from the model's markdown:
+
+      ("heading", (level, text))
+      ("list",    [{"level": int, "ordered": bool, "text": str}, ...])
+      ("table",   {"header": [str], "align": [str|None], "rows": [[str], ...]})
+      ("image",   event_id)
+      ("para",    text)
+
+    This is still not a general markdown engine, but it is no longer the
+    five-case switch it was before 2026-08-13 — nested lists, ordered lists and
+    pipe tables are parsed, because the prompt now permits them. What it still
+    does NOT handle: fenced code blocks, block quotes, and HTML, all of which the
+    prompt explicitly tells the model not to emit. Keep those two lists in step:
+    a construct the prompt allows but this function doesn't understand lands in
+    the finished .docx as raw pipe characters and asterisks, which is the one
+    genuinely bad combination.
     """
-    bullets: list[str] = []
-    for raw_line in doc.splitlines():
+    lines = doc.splitlines()
+    index = 0
+    pending: list[dict] = []
+
+    while index < len(lines):
+        raw_line = lines[index]
         line = raw_line.strip()
 
-        is_bullet = line.startswith("- ") or line.startswith("* ")
-        if bullets and not is_bullet:
-            yield ("bullets", bullets)
-            bullets = []
-
         if not line:
+            # A blank line between two list items is a "loose list", not the end
+            # of one — and models routinely put one before a sublist. Ending the
+            # list here would render the sublist as a separate top-level list.
+            if pending and _next_content_is_list_item(lines, index + 1):
+                index += 1
+                continue
+            if pending:
+                yield ("list", _assign_levels(pending))
+                pending = []
+            index += 1
             continue
+
+        table = _try_parse_table(lines, index)
+        if table is not None:
+            if pending:
+                yield ("list", _assign_levels(pending))
+                pending = []
+            block, consumed = table
+            yield ("table", block)
+            index += consumed
+            continue
+
+        item = _match_list_item(raw_line)
+        if item is not None:
+            pending.append(item)
+            index += 1
+            continue
+
+        # Anything else ends an open list.
+        if pending:
+            yield ("list", _assign_levels(pending))
+            pending = []
 
         token = _TOKEN_RE.fullmatch(line)
         if token:
             yield ("image", token.group(1))
+        elif _RULE_RE.fullmatch(line):
+            pass
         elif line.startswith("#"):
             level = len(line) - len(line.lstrip("#"))
             yield ("heading", (min(level, 4), line[level:].strip()))
-        elif is_bullet:
-            bullets.append(line[2:].strip())
         else:
             yield ("para", line)
-    if bullets:
-        yield ("bullets", bullets)
+        index += 1
+
+    if pending:
+        yield ("list", _assign_levels(pending))
 
 
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# ------------------------------------------------------------------ #
+# Inline formatting                                                    #
+# ------------------------------------------------------------------ #
+
+# Bold BEFORE italic so `**x**` isn't consumed by the single-asterisk branch;
+# the lookarounds on the italic branch are belt-and-braces for the same thing.
+#
+# Underscore emphasis (_x_) is deliberately NOT supported: this documentation is
+# full of file paths and field names like some_field_name, and treating those as
+# emphasis would silently eat the underscores. Asterisks only.
+_INLINE_RE = re.compile(
+    r"\*\*(?P<bold>.+?)\*\*"
+    r"|(?<!\*)\*(?P<italic>[^*\n]+?)\*(?!\*)"
+    r"|`(?P<code>[^`\n]+?)`"
+)
+
+
+def _iter_inline(text: str):
+    """Yield (chunk, bold, italic, code) spans covering `text` exactly once."""
+    position = 0
+    for match in _INLINE_RE.finditer(text):
+        if match.start() > position:
+            yield (text[position:match.start()], False, False, False)
+        if match.group("bold") is not None:
+            yield (match.group("bold"), True, False, False)
+        elif match.group("italic") is not None:
+            yield (match.group("italic"), False, True, False)
+        else:
+            yield (match.group("code"), False, False, True)
+        position = match.end()
+    if position < len(text):
+        yield (text[position:], False, False, False)
+
+
+def _strip_inline(text: str) -> str:
+    """Text with emphasis markers removed — for headings, which style themselves."""
+    return "".join(chunk for chunk, _b, _i, _c in _iter_inline(text))
 
 
 # ------------------------------------------------------------------ #
@@ -345,7 +583,15 @@ _HTML_SHELL = """<!DOCTYPE html>
   h3 {{ margin-top: 1.5rem; }}
   img {{ max-width: 100%; border: 1px solid #d1d5db; border-radius: 6px;
         box-shadow: 0 1px 3px rgba(0,0,0,.1); margin: .5rem 0 1rem; }}
-  ul {{ padding-left: 1.4rem; }}
+  ul, ol {{ padding-left: 1.4rem; }}
+  ul ul, ul ol, ol ol, ol ul {{ margin: .2rem 0; }}
+  code {{ background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 3px;
+         padding: .05rem .3rem; font-size: .92em;
+         font-family: Consolas, "Courier New", monospace; }}
+  table {{ border-collapse: collapse; margin: .75rem 0 1.25rem; width: 100%; }}
+  th, td {{ border: 1px solid #d1d5db; padding: .4rem .6rem; text-align: left;
+           vertical-align: top; }}
+  th {{ background: #f3f4f6; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -353,6 +599,48 @@ _HTML_SHELL = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+
+def _list_html(items: list[dict]) -> str:
+    """
+    Nested <ul>/<ol> from the flat level-tagged items.
+
+    A sublist is emitted as a SIBLING of its parent <li> rather than nested
+    inside it. That is not spec-perfect markup, but every browser indents it
+    identically, and these files are read-only artifacts rather than input to
+    anything that would care.
+    """
+    parts: list[str] = []
+    open_tags: list[str] = []
+    for item in items:
+        depth = item["level"] + 1
+        tag = "ol" if item["ordered"] else "ul"
+        while len(open_tags) > depth:
+            parts.append(f"</{open_tags.pop()}>")
+        # Same depth but switched between numbered and bulleted: close and reopen.
+        if len(open_tags) == depth and open_tags[-1] != tag:
+            parts.append(f"</{open_tags.pop()}>")
+        while len(open_tags) < depth:
+            parts.append(f"<{tag}>")
+            open_tags.append(tag)
+        parts.append(f"<li>{_inline_html(item['text'])}</li>")
+    while open_tags:
+        parts.append(f"</{open_tags.pop()}>")
+    return "".join(parts)
+
+
+def _table_html(block: dict) -> str:
+    def cell(tag: str, text: str, align: str | None) -> str:
+        style = f' style="text-align:{align}"' if align else ""
+        return f"<{tag}{style}>{_inline_html(text)}</{tag}>"
+
+    aligns = block["align"]
+    head = "".join(cell("th", t, aligns[i]) for i, t in enumerate(block["header"]))
+    body = "".join(
+        "<tr>" + "".join(cell("td", t, aligns[i]) for i, t in enumerate(row)) + "</tr>"
+        for row in block["rows"]
+    )
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
 def _write_html(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
@@ -364,9 +652,10 @@ def _write_html(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
             if level == 1:
                 title = text
             parts.append(f"<h{level}>{_inline_html(text)}</h{level}>")
-        elif kind == "bullets":
-            items = "".join(f"<li>{_inline_html(i)}</li>" for i in payload)
-            parts.append(f"<ul>{items}</ul>")
+        elif kind == "list":
+            parts.append(_list_html(payload))
+        elif kind == "table":
+            parts.append(_table_html(payload))
         elif kind == "image":
             src = images[payload]
             b64 = base64.standard_b64encode(src.read_bytes()).decode("ascii")
@@ -383,13 +672,29 @@ def _write_html(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
 
 
 def _inline_html(text: str) -> str:
-    escaped = html_module.escape(text)
-    return _BOLD_RE.sub(r"<strong>\1</strong>", escaped)
+    out: list[str] = []
+    for chunk, bold, italic, code in _iter_inline(text):
+        escaped = html_module.escape(chunk)
+        if code:
+            out.append(f"<code>{escaped}</code>")
+        elif bold:
+            out.append(f"<strong>{escaped}</strong>")
+        elif italic:
+            out.append(f"<em>{escaped}</em>")
+        else:
+            out.append(escaped)
+    return "".join(out)
 
 
 # ------------------------------------------------------------------ #
 # Word (.docx)                                                         #
 # ------------------------------------------------------------------ #
+
+# Deepest built-in "List Bullet N" style in python-docx's default template.
+_DOCX_MAX_LIST_LEVEL = 2
+# Word's default body indent step.
+_DOCX_INDENT_STEP_IN = 0.25
+
 
 def _write_docx(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
     # Imported here so a broken python-docx install only breaks docx export,
@@ -402,35 +707,117 @@ def _write_docx(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
         if kind == "heading":
             level, text = payload
             # python-docx: level 0 = Title style; map H1→Title-ish heading 0.
-            document.add_heading(_strip_bold(text), level=max(0, level - 1))
-        elif kind == "bullets":
-            for item in payload:
-                document.add_paragraph(_strip_bold(item), style="List Bullet")
+            document.add_heading(_strip_inline(text), level=max(0, level - 1))
+        elif kind == "list":
+            _add_docx_list(document, payload)
+        elif kind == "table":
+            _add_docx_table(document, payload)
         elif kind == "image":
             document.add_picture(str(images[payload]), width=Inches(6.0))
         else:
-            _add_para_with_bold(document, payload)
+            _add_docx_runs(document.add_paragraph(), payload)
 
     path = _unique_path(output_dir / f"{stem}.docx")
     document.save(str(path))
     return path
 
 
-def _strip_bold(text: str) -> str:
-    return _BOLD_RE.sub(r"\1", text)
+def _add_docx_runs(para, text: str, force_bold: bool = False) -> None:
+    """Fill a paragraph with runs carrying bold / italic / monospace."""
+    for chunk, bold, italic, code in _iter_inline(text):
+        run = para.add_run(chunk)
+        run.bold = bold or force_bold
+        run.italic = italic
+        if code:
+            run.font.name = "Consolas"
 
 
-def _add_para_with_bold(document, text: str) -> None:
-    """Paragraph preserving **bold** spans as bold runs."""
-    para = document.add_paragraph()
-    pos = 0
-    for match in _BOLD_RE.finditer(text):
-        if match.start() > pos:
-            para.add_run(text[pos:match.start()])
-        para.add_run(match.group(1)).bold = True
-        pos = match.end()
-    if pos < len(text):
-        para.add_run(text[pos:])
+def _add_docx_list(document, items: list[dict]) -> None:
+    """
+    Write a nested list.
+
+    Bulleted items use Word's built-in "List Bullet" / "List Bullet 2" / "List
+    Bullet 3" styles. NUMBERED items deliberately do not use "List Number": Word
+    numbering definitions are shared across the document, so consecutive
+    List Number paragraphs keep counting — a second numbered list under the next
+    step would start at 4 instead of 1, and there is no way to say "restart here"
+    through python-docx's public API (it needs hand-written numbering XML, which
+    is exactly the kind of thing that behaves differently in a frozen build).
+    So the number is written as literal text with a matching indent. Not a
+    semantic Word list, but the digits a reader sees are always right, and these
+    documents are read rather than edited further.
+    """
+    from docx.shared import Inches
+
+    counters: dict[int, int] = {}
+    for item in items:
+        level = min(item["level"], _DOCX_MAX_LIST_LEVEL)
+        # Returning to a shallower level (or hitting a bullet) invalidates the
+        # counters below it, so the next sublist starts at 1 again.
+        for deeper in [key for key in counters if key > level]:
+            del counters[deeper]
+
+        if item["ordered"]:
+            counters[level] = counters.get(level, 0) + 1
+            para = document.add_paragraph()
+            para.paragraph_format.left_indent = Inches(
+                _DOCX_INDENT_STEP_IN * (level + 1)
+            )
+            para.add_run(f"{counters[level]}. ")
+            _add_docx_runs(para, item["text"])
+        else:
+            counters.pop(level, None)
+            style = "List Bullet" if level == 0 else f"List Bullet {level + 1}"
+            try:
+                para = document.add_paragraph(style=style)
+            except KeyError:
+                # Template without the deeper styles: fall back to level 1 and
+                # fake the depth with an indent rather than losing the item.
+                para = document.add_paragraph(style="List Bullet")
+                para.paragraph_format.left_indent = Inches(
+                    _DOCX_INDENT_STEP_IN * (level + 1)
+                )
+            _add_docx_runs(para, item["text"])
+
+
+def _add_docx_table(document, block: dict) -> None:
+    """Write a pipe table as a real Word table with a bold header row."""
+    header = block["header"]
+    table = document.add_table(rows=1, cols=len(header))
+    try:
+        # The one border style guaranteed present in python-docx's default
+        # template. Without it a Word table has no visible gridlines at all.
+        table.style = "Table Grid"
+    except KeyError:
+        pass
+    table.autofit = True
+
+    for index, text in enumerate(header):
+        cell_para = table.rows[0].cells[index].paragraphs[0]
+        _add_docx_runs(cell_para, text, force_bold=True)
+        _align_docx_para(cell_para, block["align"][index])
+
+    for row in block["rows"]:
+        cells = table.add_row().cells
+        for index, text in enumerate(row):
+            cell_para = cells[index].paragraphs[0]
+            _add_docx_runs(cell_para, text)
+            _align_docx_para(cell_para, block["align"][index])
+
+
+def _align_docx_para(para, align: str | None) -> None:
+    """Apply a markdown column alignment. Silent no-op if unavailable."""
+    if not align or align == "left":
+        return
+    try:
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        para.alignment = {
+            "center": WD_ALIGN_PARAGRAPH.CENTER,
+            "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        }[align]
+    except (ImportError, KeyError):
+        pass
 
 
 # ------------------------------------------------------------------ #
