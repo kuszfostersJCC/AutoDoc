@@ -1,25 +1,7 @@
-"""
-main.py — AutoDoc entry point.
+"""AutoDoc entry point: DPI awareness, QApplication, theme, config, then the tray app.
 
-Responsibilities:
-1. Declare DPI awareness before anything creates a window (see below — this
-   one is load-bearing for screenshot correctness, not just cosmetics).
-2. Create the QApplication, apply the theme, start the thread seam.
-3. Ensure config.json exists next to the executable.
-4. Load the validated config and hand off to the TrayApp.
-
-There is no credential prompt at startup any more (removed 2026-08-06 with the
-Anthropic backend). The AI server's key ships as a config default, so a fresh
-install is already correctly configured; see config.py's module docstring.
-
-Important: recording and transcription are fully local and need no server at
-all. Only "Generate Documentation" talks to the AI server, and a misconfigured
-or unreachable server must never block the app from launching — it surfaces as
-a friendly error at the moment someone actually clicks Generate (see
-generation/backends/ and sessions_window.py's error handling).
-
-UI stack (2026-07-24): PySide6 / Qt Widgets. All styling is governed by
-pyside6-ui-style-guide.md and lives in theme/ — see theme/__init__.py.
+Recording and transcription are fully local; only "Generate Documentation" needs the
+AI server, so an unreachable server must never block startup.
 """
 
 import json
@@ -38,14 +20,7 @@ from theme import apply_theme
 
 
 def _setup_logging() -> None:
-    """
-    Write a plain-text log (autodoc.log, beside the exe) recording timing for
-    slow/opaque steps like Whisper model loading and transcription. There's
-    no console in the packaged build (console=False), so this is the only
-    way to see what actually happened on a machine we can't watch directly —
-    e.g. distinguishing "antivirus is scanning a freshly copied model file"
-    from "silently re-downloading it" from "just a slow disk".
-    """
+    """Set up autodoc.log beside the exe — the packaged build has no console."""
     log_path = get_app_dir() / "autodoc.log"
     logging.basicConfig(
         filename=str(log_path),
@@ -55,9 +30,6 @@ def _setup_logging() -> None:
     )
     log = logging.getLogger(__name__)
     log.info("=== AutoDoc starting (frozen=%s) ===", getattr(sys, "frozen", False))
-    # Environment fingerprint — cheap, and exactly the details needed when a
-    # build behaves differently on a machine we can't watch (dev laptop vs.
-    # clean target PC, local disk vs. flash drive, OS build differences).
     log.info(
         "env: python=%s | os=%s | machine=%s | executable=%s",
         sys.version.split()[0],
@@ -69,30 +41,12 @@ def _setup_logging() -> None:
 
 def _enable_windows_dpi_awareness() -> None:
     """
-    Declare Per-Monitor V2 DPI awareness BEFORE QApplication is constructed.
+    Declare Per-Monitor V2 DPI awareness. MUST run before QApplication(), which sets
+    process awareness itself if still unset — and it cannot be changed afterwards.
 
-    Two effects, both required:
-    1. Coordinate correctness (the important one): without awareness, Windows
-       *virtualizes* coordinates for this process — pynput click positions and
-       Win32 WindowFromPoint would disagree with mss's physical-pixel captures
-       on scaled displays, silently offsetting blur/circle positions and
-       click-target lookups. Awareness makes all of those physical pixels.
-       None of that machinery goes through Qt, so Qt cannot fix it for us.
-    2. UI scaling: Qt6 scales widgets for the display DPI on its own, but it
-       decides how based on the process's awareness context at the time
-       QApplication is created. Setting PerMonitorV2 first means Qt inherits
-       it rather than picking its own — one decision, made here, instead of
-       two subsystems disagreeing.
-
-    ORDERING IS THE WHOLE POINT: this must run before QApplication(). Qt sets
-    process DPI awareness itself if it's still unset when QApplication is
-    constructed, and awareness cannot be changed afterwards — so if this call
-    moves below QApplication it becomes a silent no-op and the recorder's
-    coordinate math regresses on any scaled display, with correct-looking
-    screenshots that have the blur in the wrong place.
-
-    Fallback chain: Per-Monitor V2 (Win10 1703+) → Per-Monitor (Win 8.1+) →
-    system DPI aware (legacy). All failures are non-fatal.
+    Without awareness Windows virtualizes this process's coordinates, so pynput click
+    positions and Win32 lookups no longer agree with mss's physical-pixel captures on
+    a scaled display, silently offsetting blur/circle positions.
     """
     if sys.platform != "win32":
         return
@@ -117,18 +71,9 @@ def _enable_windows_dpi_awareness() -> None:
 
 def _set_windows_app_id() -> None:
     """
-    Give AutoDoc its own Windows AppUserModelID.
-
-    Without this, Windows groups the app under whatever host process launched it
-    and shows THAT process's icon in the taskbar — running from source you get
-    the generic Python icon no matter what setWindowIcon() says, because the
-    taskbar button belongs to python.exe's identity, not ours. Setting an
-    explicit ID makes the taskbar button AutoDoc's own, so its icon and grouping
-    behave correctly.
-
-    Must run before any window is created. Frozen builds get their identity from
-    the exe itself, so this mainly fixes source runs — but it's harmless and
-    correct in both.
+    Give AutoDoc its own Windows AppUserModelID, before any window is created:
+    otherwise the taskbar button belongs to the host process (python.exe from source)
+    and shows that process's icon whatever setWindowIcon() says.
     """
     if sys.platform != "win32":
         return
@@ -137,17 +82,13 @@ def _set_windows_app_id() -> None:
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("JCC.AutoDoc")
     except Exception:
-        pass  # Cosmetic only — never block startup over a taskbar icon.
+        pass  # cosmetic only — never block startup over a taskbar icon
 
 
 def _app_icon() -> QIcon:
     """
-    The application icon, from assets/autodoc.ico (or a PNG fallback).
-
-    A multi-resolution .ico is strongly preferred over a PNG: Windows asks for
-    16/20/24/32/48/256px variants for the title bar, taskbar, Alt-Tab, and
-    Explorer, and a single-size PNG gets rescaled into a soft mess at the small
-    sizes where it's seen most.
+    The application icon from assets/. A multi-resolution .ico is preferred over a
+    PNG: Windows asks for 16-256px variants and rescales a single-size PNG badly.
     """
     assets = get_app_dir() / "assets"
     for name in ("autodoc.ico", "autodoc.png", "icon_idle.png"):
@@ -164,15 +105,9 @@ def _install_crash_visibility() -> None:
     """
     Route otherwise-invisible failures into autodoc.log.
 
-    In a console=False frozen build, sys.stderr is None/discarded. Python
-    reports unhandled exceptions in *threads* by writing to stderr via
-    threading.excepthook — so a background thread (e.g. the Whisper
-    preloader) that dies from an exception its own try/except doesn't cover
-    vanishes with ZERO trace in our log. This is precisely the failure mode
-    observed on 2026-07-08: _preload_whisper logged its first line, then the
-    thread died silently somewhere inside `import whisper`, and the only
-    symptom was the 300s model-wait timeout. These hooks make any such death
-    show up as a CRITICAL log line with a full traceback.
+    In a console=False frozen build sys.stderr is None, so Python's default report for
+    an unhandled exception in a worker thread is discarded and the thread dies with no
+    trace at all.
     """
     def _thread_hook(args: threading.ExceptHookArgs) -> None:
         logging.getLogger("threading").critical(
@@ -191,11 +126,8 @@ def _install_crash_visibility() -> None:
 
     sys.excepthook = _main_hook
 
-    # In a console=False build sys.stdout/sys.stderr are None, and any library
-    # that writes to them crashes with AttributeError: 'NoneType' has no
-    # attribute 'write'. Observed 2026-07-08: whisper's tqdm progress bar did
-    # exactly that inside model.transcribe(). Give them a harmless sink so no
-    # third-party print/progress-bar can ever take down a worker thread.
+    # Same build has sys.stdout/sys.stderr as None, so any library writing to them
+    # raises AttributeError (whisper's tqdm did). Give them a harmless sink.
     import os
 
     if sys.stdout is None:
@@ -204,51 +136,21 @@ def _install_crash_visibility() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
-# NOTE: there used to be a `_DEFAULT_CONFIG` dict here, used to write the
-# first-run config.json. It was deleted on 2026-07-29 — it was a hand-maintained
-# second copy of config.py's defaults and had drifted from them (it shipped
-# screenshot_mode "blurred" and local_model "llava", and it WON on a fresh
-# install because it's what created the file). The bootstrap below now dumps
-# config.default_config(), so first-run values come from the same dataclass as
-# everything else and cannot disagree. Don't reintroduce a local copy.
-
-
-# NOTE: `_prompt_for_api_key()` used to live here — a first-run dialog asking a
-# developer to paste an Anthropic key. Removed 2026-08-06 along with the
-# Anthropic backend. Don't reintroduce a credential prompt for the AI server:
-# its key is a metering label shipped as a config default, not a per-person
-# secret, and prompting for one would make a correctly-configured fresh install
-# look broken.
-
-
-# ------------------------------------------------------------------ #
-# Main                                                                 #
-# ------------------------------------------------------------------ #
-
 def main() -> None:
-    _enable_windows_dpi_awareness()  # MUST precede QApplication — see docstring
-    _set_windows_app_id()            # also before any window exists
+    _enable_windows_dpi_awareness()  # must precede QApplication — see docstring
+    _set_windows_app_id()
     _setup_logging()
     _install_crash_visibility()
 
     app = QApplication(sys.argv)
-    # AutoDoc is a tray app: closing the Sessions window must NOT quit it.
-    # Without this, Qt exits as soon as the last window closes and the tray
-    # icon disappears mid-recording.
+    # Tray app: closing the Sessions window must not quit Qt mid-recording.
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("AutoDoc")
-    # Applies to every window and dialog in the app — title bar, taskbar,
-    # Alt-Tab. Individual windows never set their own icon.
     app.setWindowIcon(_app_icon())
     ui_service.init()        # thread seam; main thread only, after QApplication
 
     config_path = get_app_dir() / "config.json"
 
-    # Create config.json with defaults if it doesn't exist yet. Those defaults
-    # are the real deployment baseline (the district AI server, endpoint, model
-    # and metering key) — see config.py's module docstring — so a fresh or
-    # reimaged machine bootstraps to a config that actually works, and works
-    # attributed to the right application.
     if not config_path.exists():
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(default_config(), f, indent=2)
@@ -256,27 +158,15 @@ def main() -> None:
     with open(config_path, encoding="utf-8") as f:
         raw = json.load(f)
 
-    # Theming happens HERE, not immediately after QApplication, because the
-    # light/dark choice is a config value (2026-07-29) and this is the first
-    # point at which config.json has been created-if-missing and read.
-    #
-    # The position is bounded on both sides and both bounds are real:
-    #   - it cannot move earlier, because `raw` doesn't exist yet;
-    #   - it cannot move later, because load_config()'s failure path raises a
-    #     QMessageBox. Theming after that means a broken-config run shows its
-    #     first dialog unstyled — in dark mode, a bright white dialog in front
-    #     of nothing.
-    # Reads raw JSON rather than the AutoDocConfig, deliberately: a malformed
-    # config must still produce a THEMED error dialog, and load_config() can't
-    # be reached before that dialog exists.
+    # Theming is pinned here: the theme is a config value, so it cannot happen before
+    # `raw` exists, and it cannot happen after load_config(), whose failure path shows
+    # a QMessageBox that would otherwise be unstyled. Raw JSON rather than the
+    # AutoDocConfig, so a malformed config still gets a themed error dialog.
     apply_theme(app, raw.get("theme"))   # Fusion + palette + app.qss + setFont
 
     try:
         config = load_config()
     except Exception as exc:
-        # Show a user-friendly error if config is malformed. This is a real
-        # blocker (the file itself can't be read), unlike a merely-missing
-        # API key above, so it's fine to stop here.
         QMessageBox.critical(
             None,
             "AutoDoc — Configuration Error",
@@ -292,11 +182,8 @@ def main() -> None:
     tray = TrayApp(config)
     tray.start()
 
-    # Allow Ctrl+C from the terminal to exit cleanly during development.
-    # Qt's event loop blocks in C++ and never yields to the Python
-    # interpreter, so a SIGINT handler alone would never run — this no-op
-    # timer forces the interpreter awake every 200ms so pending signals get
-    # dispatched. Without it, Ctrl+C is simply ignored until the app exits.
+    # Qt's event loop blocks in C++ and never yields to the interpreter, so a SIGINT
+    # handler alone would never run; this no-op timer wakes Python every 200ms.
     signal.signal(signal.SIGINT, lambda *_: tray.quit())
     _sigint_timer = QTimer()
     _sigint_timer.start(200)

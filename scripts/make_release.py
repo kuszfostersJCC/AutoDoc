@@ -1,45 +1,7 @@
-"""
-scripts/make_release.py — Package dist/AutoDoc/ into a GitHub-release-ready
-zip for the in-app "Check for Updates" feature (see updater.py at the
-project root).
+"""Packages dist/AutoDoc/ into releases/AutoDoc-v<VERSION>.zip for the in-app updater.
 
-Usage — run AFTER `pyinstaller autodoc.spec` has produced dist/AutoDoc/:
-
-    python scripts/make_release.py
-
-Produces releases/AutoDoc-v<version>.zip (version comes from version.py's
-VERSION constant — bump that first, don't pass it separately, or the shipped
-zip and the tag you create for it will disagree).
-
-WHY THIS EXCLUDES config.json, models/, sessions/, output/, exports/:
-Every install has its own config.json with its own per-machine values, its own
-cached Whisper model, and possibly its own recorded sessions if this dist/ folder
-has ever been run as a working install rather than a fresh build output.
-updater.py's apply step uses a PLAIN (non-mirroring) robocopy specifically so it
-only ever adds/overwrites files present in the release zip — leaving those paths
-out here is what keeps an update from clobbering any of it.
-
-`sessions/`, `output/` and `exports/` are the ones that genuinely must never
-escape: they can contain student data, and a public release asset cannot be
-un-published from GitHub after the fact. This list is deliberately generous
-rather than minimal for that reason. config.json is excluded to protect
-per-machine settings, NOT to hide the AI server's metering key — that key ships
-in config.py's defaults by design (see HANDOFF.md, "The key is in the public repo
-on purpose").
-
-THIS SCRIPT ZIPS THE WORKING TREE'S BUILD OUTPUT. GIT IS NEVER CONSULTED.
-Two consequences, and the second one bites:
-
-  * A branch or tag mistake cannot ship wrong code to users — the bytes come
-    from whatever `pyinstaller` last built locally. (v1.3.2 was tagged on `dev`
-    without merging to `main`; users were unaffected. See HANDOFF.md.)
-  * The zip therefore reflects UNCOMMITTED edits too. A release can contain code
-    that exists in no commit anywhere, and nothing here can detect that. Run
-    `git status` before `pyinstaller` — that is the only safeguard.
-
-The "Next steps" this prints deliberately includes the merge to `main`, because
-this output is the checklist that actually gets followed, and the merge is the
-step that got skipped when it lived only in HANDOFF.md.
+Built from the working tree's dist/, never from a git tag; config.json, models/,
+sessions/ and output/ are stripped.
 """
 
 import sys
@@ -53,7 +15,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = PROJECT_ROOT / "dist" / "AutoDoc"
 RELEASES_DIR = PROJECT_ROOT / "releases"
 
-# Never ship these, even if present in dist/AutoDoc/ (see module docstring).
 _EXCLUDE_DIRS = {"models", "sessions", "output", "exports", "_update_download", "_update_staging"}
 _EXCLUDE_FILES = {"config.json", "autodoc.log", "autodoc_update.log", "_apply_update.bat"}
 

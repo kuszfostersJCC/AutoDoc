@@ -1,31 +1,4 @@
-"""
-publish/bookstack_client.py — BookStack REST transport. No orchestration.
-
-Stdlib urllib only, matching updater.py and generation/backends/
-local_vision_backend.py. Adding `requests` would mean a requirements.txt line, a
-build-venv install, and an autodoc.spec change for no functional gain — and a
-missing module is only a WARNING to PyInstaller, so it would produce a build that
-reports success and dies on launch. (httpx IS already in the spec's
-hiddenimports as an Anthropic SDK transitive dep, but depending on it would
-couple publishing to the anthropic package staying in the tree, and the shipped
-config is provider: "local".)
-
-Cost of stdlib-only: the multipart body for image upload is hand-built below.
-Two traps in that, both of which produce a 422 from BookStack that does not name
-the cause:
-  - parts MUST be separated by CRLF, not LF;
-  - the file part needs its own Content-Type header.
-
-Auth: every request carries `Authorization: Token <id>:<secret>`.
-
-API surface used (verified against the JCC instance's /api/docs, 2026-07-27):
-  GET    /api/books?filter[name]=<name>
-  POST   /api/books                {name, description}
-  POST   /api/pages                {book_id, name, markdown, tags}
-  PUT    /api/pages/<id>           {name, markdown, tags}
-  POST   /api/image-gallery        multipart: type, uploaded_to, image, name
-  DELETE /api/image-gallery/<id>
-"""
+"""BookStack REST transport, stdlib urllib only. No orchestration."""
 
 import json
 import logging
@@ -60,10 +33,6 @@ class BookStackClient:
         self._auth = f"Token {token_id}:{token_secret}"
         self.timeout_s = timeout_s
 
-    # ------------------------------------------------------------------ #
-    # Transport                                                            #
-    # ------------------------------------------------------------------ #
-
     def _request(
         self,
         method: str,
@@ -88,8 +57,6 @@ class BookStackClient:
                 detail = exc.read().decode("utf-8", "replace")[:500]
             except Exception:
                 pass
-            # BookStack returns its validation messages in the body, and they are
-            # the only useful part of a 422 — surface them rather than "HTTP 422".
             raise BookStackError(
                 f"{method} {path} failed: HTTP {exc.code} {exc.reason}"
                 + (f"\n{detail}" if detail else ""),
@@ -109,8 +76,6 @@ class BookStackClient:
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            # Typically an HTML error page from a reverse proxy, i.e. the request
-            # never reached BookStack. Say so rather than "invalid JSON".
             raise BookStackError(
                 f"{method} {path} returned a non-JSON response "
                 f"(is {self.base_url} really a BookStack instance?)"
@@ -124,17 +89,11 @@ class BookStackClient:
             content_type="application/json",
         )
 
-    # ------------------------------------------------------------------ #
-    # Books                                                                #
-    # ------------------------------------------------------------------ #
-
     def find_book_by_name(self, name: str) -> int | None:
-        """Exact-name lookup. Returns the book id, or None."""
         query = urllib.parse.urlencode({"filter[name]": name})
         data = self._request("GET", f"/api/books?{query}")
         for entry in data.get("data", []):
-            # The filter is a LIKE match server-side, so confirm exactness here
-            # rather than trusting the first row.
+            # filter[name] is a LIKE match server-side, so confirm exactness here.
             if entry.get("name") == name:
                 return int(entry["id"])
         return None
@@ -153,10 +112,6 @@ class BookStackClient:
         log.info("bookstack: created book %r (id=%s)", name, book_id)
         return book_id
 
-    # ------------------------------------------------------------------ #
-    # Pages                                                                #
-    # ------------------------------------------------------------------ #
-
     def create_page(
         self,
         book_id: int,
@@ -166,7 +121,7 @@ class BookStackClient:
     ) -> dict:
         payload: dict = {
             "book_id": book_id,
-            "name": name[:255],       # API limit; a longer name is a hard 422
+            "name": name[:255],       # API limit; longer is a hard 422
             "markdown": markdown,
         }
         if tags:
@@ -190,18 +145,7 @@ class BookStackClient:
     def get_page(self, page_id: int) -> dict:
         return self._request("GET", f"/api/pages/{page_id}")
 
-    # ------------------------------------------------------------------ #
-    # Images                                                               #
-    # ------------------------------------------------------------------ #
-
     def upload_image(self, page_id: int, image_path: Path, name: str) -> dict:
-        """
-        Attach an image to a page's gallery. Returns the API's image record;
-        the display URL is under "url" (older versions: "path").
-
-        uploaded_to is REQUIRED by the API, which is what forces the whole
-        create-page-then-upload-then-update sequence in bookstack_publisher.py.
-        """
         mime = mimetypes.guess_type(image_path.name)[0] or "image/png"
         body, content_type = _multipart(
             fields={
@@ -222,10 +166,6 @@ class BookStackClient:
         self._request("DELETE", f"/api/image-gallery/{image_id}")
 
 
-# ------------------------------------------------------------------ #
-# Multipart encoding                                                   #
-# ------------------------------------------------------------------ #
-
 def _multipart(
     fields: dict[str, str],
     file_field: str,
@@ -233,16 +173,9 @@ def _multipart(
     file_bytes: bytes,
     file_mime: str,
 ) -> tuple[bytes, str]:
-    """
-    Build a multipart/form-data body. Returns (body, content_type_header).
-
-    CRLF line endings are mandatory per RFC 7578 — Laravel's parser (BookStack's
-    framework) rejects LF-separated parts with a validation error that blames the
-    'image' field rather than the encoding, which is a genuinely misleading
-    symptom. The boundary is a fixed literal because it only has to not appear in
-    the payload, and PNG bytes containing this exact ASCII string is not a real
-    risk.
-    """
+    """Build a multipart/form-data body -> (body, content_type_header). Hand-built
+    because urllib has none, and the file part needs its own Content-Type or
+    BookStack 422s blaming the 'image' field."""
     boundary = "----AutoDocFormBoundary7MA4YWxkTrZu0gW"
     out = bytearray()
 

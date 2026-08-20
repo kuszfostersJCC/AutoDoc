@@ -1,49 +1,52 @@
 {
-  "_comment": "Copy this file to config.json next to AutoDoc.exe. config.json is gitignored on purpose. Regenerated 2026-08-06 from config.py's AutoDocConfig defaults, which are the single source of truth; the values below ARE the shipped deployment baseline, so a fresh install that just runs the app gets this file written for it automatically and only needs editing to change something. This file is documentation for humans — no code reads it, so it can only go stale, never break anything.",
+  "_comment": "Copy this file to config.json next to AutoDoc.exe; it is documentation for humans, no code reads it.",
 
   "whisper_model": "base",
+
+  "_audio_comment": "A device NAME (not a PortAudio index, which shifts when hardware changes); empty means the Windows default input.",
+  "audio_device": "",
   "sessions_dir": "sessions",
   "output_dir": "output",
   "max_screenshots_per_session": 100,
   "max_image_dimension": 1280,
 
-  "_ai_server_comment": "AutoDoc talks to the district's on-premises AI server and nothing else — the Anthropic/Claude API backend was removed on 2026-08-06, along with the 'provider', 'api_key' and 'claude_model' keys. Narration and screenshots never leave the network, which is the FERPA-relevant property. See the server's own README for the full stack.",
+  "_ai_server_comment": "AutoDoc talks only to the district's on-premises AI server, so narration and screenshots never leave the network.",
 
-  "_endpoint_comment": "MUST be port 8080. That is the metering proxy, and it is the only endpoint that counts tokens per application. Port 8081 is the llama-server router: it answers requests correctly, which makes it a tempting fix when the proxy is down, but tokens sent there are invisible to every metric and dashboard. AutoDoc warns about 8081 in the Settings tab, in autodoc.log and at build time, but does not block it — it is a legitimate emergency fallback.",
+  "_endpoint_comment": "Must be port 8080, the metering proxy; 8081 answers requests but bypasses metering.",
   "local_endpoint": "http://172.20.28.203:8080/v1/chat/completions",
 
-  "_model_comment": "Must match a model id the server actually serves (Settings tab → Fetch lists them). Only ONE model is resident on the GPU at a time, so picking something other than the shared default means every generation may trigger a model swap — tens of seconds of cold start, and it evicts whatever the other applications were using. A model without a paired mmproj vision projector cannot see screenshots at all and will quietly produce narration-only documentation; Fetch flags those.",
+  "_model_comment": "Must match a model id the server serves (Settings tab -> Fetch); a model with no mmproj projector cannot see screenshots.",
   "local_model": "gemma4-e4b-fast",
 
-  "_api_key_comment": "AN ATTRIBUTION IDENTIFIER, NOT A SECRET. The server accepts requests with no key and files them under 'chat-ui', so this value buys attribution rather than access — which is why it is committed here and in config.py's defaults, deliberately, and why its visibility in the public repo is fine and settled. What it costs to get wrong: a blank or mistyped value produces perfectly good documentation while folding AutoDoc's usage into aggregate staff chat and corrupting the per-app record the metering stack exists to produce, with no user-visible symptom. The Settings tab reports attribution status and the backend logs a warning on every generation. This is the 'doc-generator' key; if the server rotates it, generation fails with an explicit 401/403 naming this setting.",
+  "_api_key_comment": "A metering label, not a secret: a blank value silently attributes AutoDoc's usage to 'chat-ui'.",
   "local_api_key": "sk-nuPkxLzZ3YFETKOCwhvCXRPjdWB4Ip_J",
 
-  "_screenshot_comment": "screenshot_mode is a RENDER setting, not a capture setting — screenshots are always stored raw, so this is changeable per session after the fact in the session editor. 'raw' | 'blurred' (privacy blur outside a clear circle at the click) | 'circled' (red ring at the click).",
-  "screenshot_mode": "raw",
+  "_screenshot_comment": "A render setting, not a capture setting: 'raw' | 'blurred' | 'circled', changeable per session afterwards.",
+  "screenshot_mode": "circled",
   "circle_radius_px": 36,
   "focus_radius_px": 200,
   "blur_strength": 15,
 
-  "_output_comment": "output_formats: any subset of md/html/docx. The first entry is what the 'Saved:' dialog offers to open.",
+  "_output_comment": "Any subset of md/html/docx; the first entry is what the 'Saved:' dialog offers to open.",
   "output_formats": ["docx", "html", "md"],
 
-  "_hotkey_comment": "Global hotkeys, active only while recording. pynput GlobalHotKeys syntax; empty string disables one. Avoid ctrl+shift+p — that opens the print dialog in browsers and Office, which is exactly where workflows get recorded.",
+  "_hotkey_comment": "pynput GlobalHotKeys syntax, active only while recording; empty string disables one.",
   "manual_capture_hotkey": "<ctrl>+<shift>+s",
   "pause_hotkey": "<ctrl>+<alt>+p",
   "stop_hotkey": "<ctrl>+<shift>+e",
 
-  "_bookstack_comment": "BookStack publishing (v1.3). When enabled, Generate also pushes a markdown page with inline screenshots to bookstack_book. The bot token is NOT a setting here on purpose — it lives in its own file (see publish/token.py). Note that the AI server's local_api_key above deliberately does NOT follow that pattern: the BookStack token already exists on every machine, whereas the metering key is new, and a config default is the only thing that reaches an already-deployed install (see config.py's module docstring).",
+  "_bookstack_comment": "When enabled, Generate also publishes a markdown page to bookstack_book; the bot token lives in its own file, not here.",
   "bookstack_enabled": false,
   "bookstack_base_url": "http://jcbookstack.jccmi.edu",
   "bookstack_book": "AutoDoc",
   "bookstack_timeout_s": 30,
 
-  "_bookstack_tag_comment": "Tag defaults, validated against publish/tags.py's controlled vocabulary — an unrecognised value is dropped, not passed through, so a typo costs one tag rather than splitting a BookStack filter. Empty string skips a tag. Status is always 'draft' on publish and is not configurable.",
+  "_bookstack_tag_comment": "Validated against publish/tags.py's vocabulary; an unrecognised value is dropped, empty string skips the tag.",
   "bookstack_tag_doc_type": "sop",
   "bookstack_tag_owner": "it-ops",
   "bookstack_tag_audience": "all-staff",
   "bookstack_tag_review_cycle": "ad-hoc",
 
-  "_theme_comment": "theme: 'light' | 'dark'. Changeable from the Settings tab, where it applies immediately. An unrecognised value falls back to 'light' with a line in autodoc.log rather than failing to start.",
+  "_theme_comment": "'light' | 'dark'; an unrecognised value falls back to 'light'.",
   "theme": "light"
 }

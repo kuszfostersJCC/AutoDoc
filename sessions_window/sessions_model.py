@@ -1,15 +1,6 @@
-"""
-sessions_window/sessions_model.py — table model for the session list.
+"""Table model over the session dicts from sessions_window._load_sessions().
 
-QAbstractTableModel over the plain dicts that _load_sessions() produces (see
-sessions_window.py). Deliberately a *model*, not a QTableWidget: the view
-needs per-column alignment and a custom-painted status column, and item
-widgets can't do either without leaking styling into Python.
-
-The model holds the dict list verbatim rather than flattening it into strings,
-because the window needs the original dict (session_dir, status, counts) for
-every action — Generate, Retranscribe, Record More, Export, Delete. Use
-session_at(row) for that; display formatting stays in data().
+Rows are held verbatim; session_at(row) hands the original dict back to callers.
 """
 
 import logging
@@ -19,7 +10,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
 log = logging.getLogger(__name__)
 
-# Column order is the display order. STATUS is painted by StatusDelegate.
+# STATUS is painted by StatusDelegate.
 COL_NAME, COL_DURATION, COL_SCREENSHOTS, COL_SEGMENTS, COL_STATUS = range(5)
 
 _HEADERS = {
@@ -30,8 +21,7 @@ _HEADERS = {
     COL_STATUS: "Status",
 }
 
-# Numeric columns are right-aligned, and §6 requires the header to use the
-# SAME alignment as its cells — both read this one mapping so they can't drift.
+# Cells and headers both read this mapping so their alignment cannot drift.
 _ALIGNMENT = {
     COL_NAME: Qt.AlignLeft | Qt.AlignVCenter,
     COL_DURATION: Qt.AlignRight | Qt.AlignVCenter,
@@ -45,8 +35,6 @@ class SessionsModel(QAbstractTableModel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._rows: list[dict] = []
-
-    # ---- Qt model interface ---------------------------------------- #
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
@@ -77,9 +65,8 @@ class SessionsModel(QAbstractTableModel):
             return int(_ALIGNMENT[col])
 
         if role == Qt.ToolTipRole:
-            # The name column elides on narrow windows (§6: tables shrink by
-            # eliding, never by forcing the window wider), so the full name has
-            # to remain reachable somehow.
+            # The name column elides on narrow windows; the tooltip keeps the
+            # full name reachable.
             if col == COL_NAME:
                 return row["name"]
             return None
@@ -94,8 +81,6 @@ class SessionsModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole:
             return int(_ALIGNMENT.get(section, Qt.AlignLeft | Qt.AlignVCenter))
         return None
-
-    # ---- AutoDoc helpers ------------------------------------------- #
 
     def set_sessions(self, sessions: list[dict]) -> None:
         """Replace all rows. Full reset — the list is small (tens of items)."""

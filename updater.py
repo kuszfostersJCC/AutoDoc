@@ -1,37 +1,9 @@
-"""
-updater.py — Manual "Check for Updates" against GitHub Releases.
+"""Manual "Check for Updates" against GitHub Releases; no polling, no auto-install.
 
-Deliberately manual, not automatic: users decide per-release whether they
-want whatever changed (see Settings tab). There is no background polling
-and no silent auto-install.
-
-WHY A DETACHED SCRIPT DOES THE ACTUAL FILE SWAP (read before "simplifying"):
-While AutoDoc.exe is running, Windows holds an open handle on the exe itself
-and every DLL/pyd under _internal/ — nothing, including AutoDoc's own code,
-can overwrite those files in place. The only way to update them is to hand
-off to a SEPARATE process, exit AutoDoc so its locks are released, let that
-process replace the files, then relaunch. build_update_script() writes a
-small detached .bat that does exactly that; launch_update_and_exit() spawns
-it and the caller (Settings tab) is responsible for quitting the app
-immediately afterward — see sessions_window/settings_panel.py's
-_apply_update().
-
-WHY PLAIN ROBOCOPY, NOT /MIR: the release zip (see scripts/make_release.py)
-never contains config.json, models/, sessions/, output/, or exports/ — only
-code (AutoDoc.exe, _internal/, assets/). A plain (non-mirroring) robocopy
-therefore only ever ADDS/OVERWRITES files that exist in the new release; it
-never deletes anything, so there's no exclusion list to keep in sync and no
-way for an update to eat a user's config or recordings. The one accepted
-cost: a file removed between versions (e.g. a dropped DLL) is left behind as
-harmless orphaned disk usage — same tradeoff already made for orphaned
-imported-screenshot files (see recorder/session.py::import_screenshots).
-
-No new dependency: plain stdlib urllib for the GitHub API + download,
-consistent with generation/backends/local_vision_backend.py. Extraction
-shells out to PowerShell's Expand-Archive (built into Windows 10+) from the
-generated .bat rather than pulling Python's zipfile into the "runs after
-AutoDoc has already exited" script — keeps that script a single flat file
-with no Python interpreter dependency at all.
+Windows holds handles on AutoDoc.exe and everything under _internal/ while it runs,
+so the file swap is done by a detached .bat after AutoDoc exits. That robocopy is
+deliberately not /MIR: it only adds and overwrites, so an update can never delete a
+machine's config.json, sessions, or output.
 """
 
 import json
@@ -63,27 +35,19 @@ _SCRIPT_NAME = "_apply_update.bat"
 
 @dataclass
 class UpdateInfo:
-    version: str          # e.g. "1.2.0" — leading 'v' already stripped
-    notes: str             # release body (changelog), shown verbatim to the user
-    download_url: str      # zip asset's browser_download_url
+    version: str          # leading 'v' already stripped
+    notes: str             # release body, shown verbatim to the user
+    download_url: str
     asset_name: str
-    asset_size: int         # bytes, for a "~12 MB" hint in the UI
+    asset_size: int         # bytes
 
 
 class UpdateCheckError(Exception):
-    """
-    Network/parse failure while checking for or downloading an update.
-    Always caught by the caller and shown as a friendly status message —
-    GitHub being unreachable (offline machine, district network blocking
-    github.com, GitHub itself being down) must never be treated as "no
-    update available".
-    """
+    """Failure while reaching or parsing GitHub; never treat one as "no update available"."""
 
 
 def _parse_version(v: str) -> tuple:
-    """'v1.10.2' -> (1, 10, 2). Non-numeric trailing junk (e.g. '-beta') is
-    dropped from that segment rather than raising, so a release note that
-    breaks strict semver still compares as best-effort."""
+    """'v1.10.2' -> (1, 10, 2); non-numeric junk in a segment becomes 0 rather than raising."""
     v = v.strip().lstrip("vV")
     parts = []
     for segment in v.split("."):
@@ -98,10 +62,8 @@ def is_newer(remote: str, local: str = VERSION) -> bool:
 
 def check_for_update() -> Optional[UpdateInfo]:
     """
-    Query GitHub's public "latest release" endpoint (no auth — the repo is
-    public, and this keeps AutoDoc.exe from ever needing a token baked in).
-    Returns None when already on the latest version. Raises UpdateCheckError
-    on any failure to reach/parse the API.
+    The latest release if it is newer than VERSION, else None; raises
+    UpdateCheckError on any API failure. Unauthenticated — the repo is public.
     """
     request = urllib.request.Request(
         _RELEASES_API,
@@ -149,11 +111,7 @@ def check_for_update() -> Optional[UpdateInfo]:
 
 
 def download_update(info: UpdateInfo) -> Path:
-    """
-    Download the release zip into a scratch folder beside the exe. Returns
-    the local zip path. Raises UpdateCheckError on failure; any partial file
-    is removed first.
-    """
+    """Download the release zip beside the exe; a partial file is removed on failure."""
     dest_dir = get_app_dir() / _DOWNLOAD_DIRNAME
     dest_dir.mkdir(parents=True, exist_ok=True)
     zip_path = dest_dir / info.asset_name
@@ -173,11 +131,8 @@ def download_update(info: UpdateInfo) -> Path:
 
 def build_update_script(zip_path: Path, app_dir: Path, exe_name: str = "AutoDoc.exe") -> Path:
     """
-    Write the detached .bat that performs the actual update after AutoDoc
-    exits: extract the downloaded zip, robocopy it over app_dir (adds/
-    overwrites only — see module docstring for why this is deliberately not
-    /MIR), relaunch the exe, then delete its own downloaded artifacts
-    including itself.
+    Write the detached .bat that runs after AutoDoc exits: extract the zip,
+    robocopy it over app_dir, relaunch the exe, then delete its own artifacts.
     """
     staging = app_dir / _STAGING_DIRNAME
     script_path = app_dir / _SCRIPT_NAME
@@ -224,10 +179,8 @@ del "%~f0"
 
 def launch_update_and_exit(zip_path: Path) -> None:
     """
-    Spawn the detached updater script. Does NOT quit AutoDoc itself — the
-    caller (Settings tab) must call the app's quit routine immediately
-    afterward so the script's 2s wait is enough. Nothing after that quit
-    call should assume this process is still alive.
+    Spawn the detached updater script. The caller must quit AutoDoc immediately
+    afterwards — the script only waits 2s for our file handles to be released.
     """
     app_dir = get_app_dir()
     script_path = build_update_script(zip_path, app_dir)

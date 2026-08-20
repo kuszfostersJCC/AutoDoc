@@ -1,47 +1,4 @@
-"""
-publish/bookstack_publisher.py — orchestration for publishing a generated
-document to BookStack. Design rationale lives in PRD-v1.3-bookstack.md.
-
-THE THREE PHASES, AND WHY
-
-The API forces the sequence; it is not a design choice. `POST /api/image-gallery`
-requires `uploaded_to` (a page id), so the page must exist before its images can
-be attached — and `POST /api/pages` requires `markdown` or `html`, so the page
-cannot be created empty. Therefore:
-
-  1. create the page with a PLACEHOLDER body (the document minus screenshots)
-  2. upload each screenshot against the new page id
-  3. PUT the final body with the returned image URLs
-
-Phase 1's placeholder is the token-stripped document rather than a stub line, so
-that a failure in phase 2 or 3 leaves a page whose text is still readable instead
-of a page saying "pending".
-
-RESUMABILITY, NOT JUST RETRYABILITY
-
-Because phase 2 can fail partway, the page id is recorded in session.json as soon
-as phase 1 succeeds — including on the failure path. A retry then ADOPTS that
-page and updates it rather than creating a second one. Losing the id on failure is
-what would turn one transient network error into a duplicate wiki page.
-
-IDEMPOTENCY
-
-Republishing (Retranscribe → Generate, Record More → Generate, edit → Generate)
-must update the existing page, never create another. BookStack keeps page
-revisions, so an update is reversible from its own UI — which is what makes
-"always update" the safe default rather than a risk. Superseded gallery images
-are deleted before the new set is uploaded (decision 2026-07-27), since they
-exist only to serve this one page.
-
-IMAGES ARE ALWAYS THE RENDERED ONES. This module uploads PreparedDocument.images
-exactly as given — render_event_to_cache() output, with the session's render mode,
-click circle, and redaction regions already applied. It never resolves image paths
-itself. Doing so would upload un-redacted captures while the local .docx looked
-correct, which is the one failure in this feature that isn't self-evident from
-looking at the result.
-
-THREADING: blocking network I/O. Worker thread only; touches no widgets.
-"""
+"""Publishes a generated document to BookStack. Worker thread only; no widgets."""
 
 import json
 import logging
@@ -64,12 +21,7 @@ _BOOK_DESCRIPTION = (
 
 @dataclass
 class PublishResult:
-    """
-    Outcome of one publish attempt.
-
-    skipped is not a failure: publishing disabled in config, or no token file
-    present. Callers should say nothing to the user in that case.
-    """
+    """Outcome of one publish attempt. `skipped` is not a failure."""
 
     ok: bool = False
     skipped: bool = False
@@ -86,28 +38,15 @@ def publish_session(
     session_data: dict,
     prepared: PreparedDocument,
 ) -> PublishResult:
-    """
-    Publish a generated document to BookStack. Never raises.
-
-    Returns a PublishResult and, as a side effect, records outcome state under
-    session.json's "bookstack" key. Errors are returned rather than raised
-    because the local output files are already written by the time this runs and
-    must not be lost to a wiki problem (see generation/run.py).
-    """
+    """Publish to BookStack, recording the outcome in session.json. Never raises."""
     if not getattr(config, "bookstack_enabled", False):
         return PublishResult(skipped=True, reason="disabled in settings")
 
     token = load_token()
     if token is None:
-        # load_token already logged the resolved path and the specific reason.
         return PublishResult(skipped=True, reason="no BookStack token available")
 
-    # MUTATED IN PLACE by _publish, deliberately. The failure paths below need to
-    # see the page id that phase 1 just created, and a rebind inside _publish
-    # would not propagate here — that exact mistake made every failed first
-    # publish create ANOTHER page on the next attempt, which is the one outcome
-    # this module's whole design exists to prevent. Do not "clean this up" by
-    # having _publish return a new dict.
+    # Mutated in place by _publish: failure paths need the page id, else retries duplicate.
     state = dict(session_data.get("bookstack") or {})
 
     try:
@@ -121,7 +60,6 @@ def publish_session(
     except BookStackError as exc:
         return _fail(session_dir, state, str(exc))
     except Exception as exc:                                    # noqa: BLE001
-        # A bug here must not take down a generation that already produced files.
         log.exception("bookstack: unexpected publish failure")
         return _fail(session_dir, state, repr(exc))
 
@@ -135,10 +73,6 @@ def publish_session(
     return result
 
 
-# ------------------------------------------------------------------ #
-# The three phases                                                     #
-# ------------------------------------------------------------------ #
-
 def _publish(
     client: BookStackClient,
     config,
@@ -146,6 +80,7 @@ def _publish(
     prepared: PreparedDocument,
     state: dict,
 ) -> PublishResult:
+    # The API forces this order: the page must exist before images can attach to it.
     title = _page_title(session_data, prepared)
     payload_tags = tag_vocab.build_tags(
         doc_type=getattr(config, "bookstack_tag_doc_type", "sop"),
@@ -154,12 +89,8 @@ def _publish(
         review_cycle=getattr(config, "bookstack_tag_review_cycle", "ad-hoc"),
     )
 
-    # ---- phase 1: page ------------------------------------------------
     page_id = state.get("page_id")
     if page_id is not None and not _page_exists(client, page_id):
-        # Someone deleted it in BookStack. Adopting a dead id would fail forever,
-        # so fall back to creating a new page rather than requiring a hand edit
-        # of session.json.
         log.warning("bookstack: page %s no longer exists — creating a new one", page_id)
         page_id = None
         state.clear()
@@ -172,14 +103,10 @@ def _publish(
             book_id=book_id, name=title, markdown=placeholder, tags=payload_tags
         )
         page_id = int(page["id"])
-        # Mutated, never rebound — see publish_session's note. If phase 2 dies,
-        # the caller's failure handler must be able to see THIS page id so the
-        # retry adopts the page instead of creating another one.
         state.clear()
         state.update({"page_id": page_id, "book_id": book_id, "image_ids": []})
         log.info("bookstack: created page %s (%r)", page_id, title)
 
-    # ---- phase 2: images ----------------------------------------------
     # Delete first, so a republish can't leave both generations' images attached.
     _delete_images(client, state.get("image_ids") or [])
     state["image_ids"] = []
@@ -193,13 +120,6 @@ def _publish(
             )
         except BookStackError as exc:
             if exc.status == 403:
-                # BookStack's ImageGalleryApiController::create checks TWO
-                # permissions: image-create-all, and then page-update on the page
-                # named by uploaded_to. A bot that can create pages but not update
-                # them therefore 403s here on its own freshly-created page, and
-                # the message says nothing about pages — so say it ourselves.
-                # (The same missing permission would fail phase 3's PUT, which
-                # this failure hides by happening first.)
                 raise BookStackError(
                     "image upload was refused (HTTP 403). BookStack requires BOTH "
                     "'Images: Create All' AND page-update permission on the target "
@@ -219,11 +139,9 @@ def _publish(
         urls[event_id] = url
         if record.get("id") is not None:
             image_ids.append(int(record["id"]))
-        # Recorded as we go: a failure halfway through must still let the retry
-        # clean up what DID upload.
+        # Recorded as we go so a retry can clean up whatever did upload.
         state["image_ids"] = list(image_ids)
 
-    # ---- phase 3: final body ------------------------------------------
     final = substitute_tokens(
         prepared.doc,
         lambda eid: f"![Screenshot {eid}]({urls[eid]})" if eid in urls else "",
@@ -249,17 +167,8 @@ def _publish(
     )
 
 
-# ------------------------------------------------------------------ #
-# Helpers                                                              #
-# ------------------------------------------------------------------ #
-
 def _page_title(session_data: dict, prepared: PreparedDocument) -> str:
-    """
-    The document's H1, falling back to the session name.
-
-    Deliberately prepared.title and NOT prepared.stem — the stem is the filename
-    form, so it would title the page "Reset_a_Locked_Account".
-    """
+    """The document's H1, falling back to the session name."""
     title = (prepared.title or "").strip()
     if not title:
         title = (
@@ -281,14 +190,8 @@ def _page_exists(client: BookStackClient, page_id: int) -> bool:
 
 
 def _image_url(record: dict, base_url: str) -> str:
-    """
-    Pull the display URL out of an image-gallery record.
-
-    Field name varies across BookStack versions ("url" currently, "path"
-    historically, "thumbs.display" on some), so try each rather than assuming.
-    Relative values are made absolute — a relative path in markdown resolves
-    against the page's own URL and silently 404s.
-    """
+    """Absolute display URL for an image-gallery record; the field name varies by
+    BookStack version, and a relative URL would resolve against the page's own URL."""
     candidate = record.get("url") or record.get("path") or ""
     if not candidate:
         thumbs = record.get("thumbs") or {}
@@ -299,13 +202,7 @@ def _image_url(record: dict, base_url: str) -> str:
 
 
 def _delete_images(client: BookStackClient, image_ids: list) -> None:
-    """
-    Remove a previous generation's gallery images.
-
-    Best-effort: a failure here is logged and swallowed. An orphaned image is
-    harmless disk usage, whereas aborting the publish over one would block the
-    document itself — the wrong trade.
-    """
+    """Remove a previous generation's gallery images. Failures are logged only."""
     for image_id in image_ids:
         try:
             client.delete_image(int(image_id))
@@ -314,15 +211,7 @@ def _delete_images(client: BookStackClient, image_ids: list) -> None:
 
 
 def _fail(session_dir: Path, state: dict, error: str) -> PublishResult:
-    """
-    Record a failed attempt, KEEPING whatever phase 1 achieved.
-
-    `state` is the same dict _publish mutated, so page_id survives here even
-    though the publish raised. That is the whole point: without it, a phase-2
-    failure on a first publish loses the page id and the next attempt creates a
-    duplicate page — observed in the field 2026-07-27 (pages 207 and 208 from two
-    attempts at the same session).
-    """
+    """Record a failed attempt, keeping the page id so a retry adopts that page."""
     state = dict(state)
     state["status"] = "failed"
     state["error"] = error[:1000]
@@ -335,14 +224,8 @@ def _fail(session_dir: Path, state: dict, error: str) -> PublishResult:
 
 
 def _write_state(session_dir: Path, state: dict) -> None:
-    """
-    Merge `state` into session.json's "bookstack" key, atomically.
-
-    Re-reads from disk rather than writing back the caller's copy: generation can
-    take minutes, and the user may well have saved edits in the session editor
-    meanwhile. Writing our stale in-memory dict would silently discard them.
-    Never raises — failing to record publish state must not fail the publish.
-    """
+    """Merge `state` into session.json's "bookstack" key, atomically; never raises.
+    Re-reads from disk so edits saved during generation are not clobbered."""
     path = session_dir / "session.json"
     try:
         with open(path, encoding="utf-8") as f:

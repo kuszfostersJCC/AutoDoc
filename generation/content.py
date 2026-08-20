@@ -1,103 +1,7 @@
-"""
-generation/content.py — Provider-agnostic prompt and content-block construction.
+"""Builds the system prompt and the neutral text/image content blocks for a session.
 
-This module builds the system prompt and a *neutral* list of content blocks from a
-session (narration + screenshots). It knows nothing about Anthropic, OpenAI, or any
-other wire format — that translation happens in generation/backends/. Keeping this
-layer neutral is what makes it possible to swap generation providers (cloud API vs.
-a local vision model) without touching prompt logic, session parsing, or the UI.
-
-Neutral content block shapes:
-    {"type": "text", "text": str}
-    {"type": "image", "path": Path}   # PNG already saved to disk; backends read bytes
-
---------------------------------------------------------------------------
-NARRATION AND SCREENSHOTS ARE INTERLEAVED — ALWAYS (fixed 2026-08-13)
---------------------------------------------------------------------------
-
-Screenshots are emitted at their place in the timeline, beside the narration
-spoken while they were taken. That pairing is most of what makes a 25-step
-recording tractable: the model gets "here is what was said, here is the window it
-was said about" rather than a wall of text followed by a wall of images it has to
-re-align from timestamps itself.
-
-It did not always work that way. Whenever `edited_full_transcript` was present
-this module emitted the whole blob first and every screenshot after it — and the
-session editor wrote that blob on EVERY save, so any session anyone had curated
-at all took the degraded path. Fixing the editor (see recorder/transcript.py)
-made per-segment edits the normal case, and the blob now only appears after a
-genuine restructure. When it does appear, it is emitted first as the authoritative
-wording AND the segment timeline is still interleaved with the screenshots for
-alignment, with the model told explicitly which of the two to trust on wording.
-The narration is duplicated on that path: a few percent of a payload dominated by
-images, which is a bargain for keeping the alignment.
-
-Imported photos (`click_type == "imported"`) are the one thing with genuinely no
-timeline position — recorder/session.py::import_screenshots() spaces them 1s after
-the last event, so their offsets are ordering, not timing. They are grouped at the
-end under their own heading instead of interleaved, which is the part the old
-blob-first shape was actually right about.
-
---------------------------------------------------------------------------
-THE SESSION PREAMBLE USES ONLY WHAT WAS ALREADY CAPTURED
---------------------------------------------------------------------------
-
-`_session_preamble()` hands the model the session name, duration, screenshot
-count, and the applications and window titles UI Automation already recorded at
-click time. Every bit of that was being collected before this change — the name
-comes from the dialog shown when a recording stops — and it feeds the two sections
-the model otherwise has to invent from narration alone (Overview, Prerequisites).
-
-Do NOT extend this by asking the user for more (audience, purpose, document type).
-Almost nobody at the institution writes documentation today, so the binding risk
-is people deciding the tool costs more than it returns, and a new required field
-at rollout buys prompt quality with the scarcest thing available. Harvest what
-recording already knows.
-
---------------------------------------------------------------------------
-CLICK-TARGET GROUND TRUTH IS TIERED, NOT ABSOLUTE (fixed 2026-08-13)
---------------------------------------------------------------------------
-
-UI Automation's `ElementFromPoint` returns the DEEPEST element under the cursor,
-which in a browser is very often a container or a run of text rather than the
-control the person meant to click. The captured name is then not a label at all.
-Observed in a real generated document, all three traceable to the same cause:
-
-    "click the pane titled **1 of 2**"                 (control type: pane —
-                                                        a carousel indicator)
-    "click the document titled **Sign in to your       (control type: document —
-     account**"                                        name is the PAGE TITLE)
-    "click on the text **Hello, Foster Kusz!**"        (control type: text —
-                                                        and it leaked a real name)
-
-None of that was the model inventing things. The prompt used to say *"Treat these
-element names as authoritative … never contradict a ground-truth label based on
-what you think you see in the image"*, so the model was obeying instructions. The
-fix belongs in the harness, not in a bigger model: `_describe_click()` now judges
-each capture and tells the model which of two situations it is in.
-
-  * **Actionable role + usable name** (`_ACTIONABLE_ROLES`, `_label_is_unusable`)
-    → presented as reliable, with an instruction to reuse it verbatim. This is
-    the case worth having; it is why the click-target capture exists.
-  * **Anything else** → stated explicitly as "no named control could be
-    identified", naming the container type so the model understands why, and
-    sending it to the screenshot. Any captured text is still shown, but labelled
-    as context for understanding and explicitly not to be quoted.
-
-Judgement moved from the model into the harness on purpose. A 4B-class local
-model will follow "this name is reliable / this one is not" far more dependably
-than it will apply a rule about when to distrust something.
-
-**Window titles are captured at click time, so on any click that navigates they
-name the page being LEFT.** That is how a document came to say "click Home in the
-New Incognito Tab window". They are now labelled "window before this click", run
-through `clean_window_title()` to drop "- Google Chrome" style decoration, and
-the prompt forbids putting title-bar text into step text at all.
-
-Raw capture is left alone: `recorder/ui_inspect.py` still records whatever UIA
-said, and all of this judgement happens at prompt-build time. Same principle as
-storing screenshots raw and rendering on demand — the heuristics here will need
-tuning, and that must not require re-recording anything.
+The markdown subset the prompt permits must stay in step with what
+generation/renderers.py::_iter_blocks() can parse.
 """
 
 import re
@@ -105,13 +9,13 @@ from pathlib import Path
 
 from recorder.screenshot import (
     event_is_legacy,
+    event_note,
     render_event_to_cache,
     resolve_render_mode,
 )
 from recorder.transcript import ordered_segments, segment_text
 
-# Screenshot-handling sentence, per render mode. Injected into the system
-# prompt so the model's expectations match what the images actually look like.
+# Injected into the system prompt so the model's expectations match the images.
 SCREENSHOT_DESCRIPTIONS = {
     "raw": (
         "Screenshots are unmodified screen captures. The click position for each "
@@ -238,10 +142,9 @@ reference images.
 
 
 def resolve_session_mode(session_data: dict, config) -> str:
-    """
-    The render mode this session's images will actually use. Legacy sessions
-    (pre-raw-storage, destructively blurred PNGs) are always "blurred"
-    regardless of settings, because that's what the pixels are.
+    """The render mode this session's images will use.
+
+    Legacy sessions are always "blurred" because their stored PNGs already are.
     """
     events = session_data.get("events", [])
     screenshots = [e for e in events if e.get("type") == "screenshot"]
@@ -256,13 +159,7 @@ def get_system_prompt(mode: str) -> str:
     return _SYSTEM_PROMPT_TEMPLATE.format(screenshot_description=desc)
 
 
-# --------------------------------------------------------------------- #
-# Click-target ground truth, tiered by how much it can be trusted        #
-# (2026-08-13 — see the module docstring section below)                  #
-# --------------------------------------------------------------------- #
-
-# UIA control types that name something a reader can actually look for and
-# click. Only these get presented to the model as a control name to reuse.
+# UIA control types whose name is presented to the model as a reusable label.
 _ACTIONABLE_ROLES = {
     "button", "checkbox", "combo box", "link", "list item", "menu item",
     "radio button", "split button", "tab", "tab item", "text field",
@@ -270,19 +167,13 @@ _ACTIONABLE_ROLES = {
     "data item",
 }
 
-# Names UIA reports that are never a control label a person would recognise.
-# "1 of 2" is a carousel/position indicator; the pattern shows up constantly on
-# marketing pages and is what produced "click the pane titled 1 of 2".
+# Carousel/position indicators ("1 of 2") are never a control label.
 _POSITION_NAME_RE = re.compile(r"^\d+\s*(of|/)\s*\d+$", re.IGNORECASE)
 
-# Beyond this, the "name" is a sentence or a paragraph of page text, not a
-# label. recorder/ui_inspect.py truncates at 120 chars, which is far past the
-# length of any real control label.
+# Past this length the "name" is page prose, not a label.
 _MAX_LABEL_CHARS = 60
 
-# Window-manager decoration on a title bar. Stripping it matters twice: the
-# model quotes these verbatim into step text if it sees them, and the preamble's
-# application list reads as noise with them attached.
+# Title-bar decoration; the model quotes it verbatim into step text if it sees it.
 _TITLE_SUFFIX_RE = re.compile(
     r"\s*[-–—|]\s*("
     r"Google Chrome|Chromium|Mozilla Firefox|Microsoft. Edge|Microsoft Edge"
@@ -290,21 +181,13 @@ _TITLE_SUFFIX_RE = re.compile(
     r")\s*$",
     re.IGNORECASE,
 )
-# Edge appends a profile segment before the browser name ("… - Work - Microsoft
-# Edge"), so one pass can leave "… - Work" behind. Two passes is enough for
-# every real title; a loop risks eating a legitimate trailing segment.
+# Edge inserts a profile segment ("… - Work - Microsoft Edge"), so a second,
+# bounded pass is needed; a loop would eat legitimate trailing segments.
 _TITLE_PROFILE_RE = re.compile(r"\s*[-–—]\s*(Work|Personal|Profile \d+)\s*$", re.IGNORECASE)
 
 
 def clean_window_title(title: str) -> str:
-    """
-    A window title with browser/profile decoration removed.
-
-    "Home Page - Jackson College - Google Chrome" → "Home Page - Jackson College"
-
-    Public because the preamble's application list wants the same treatment.
-    Returns "" unchanged; never raises.
-    """
+    """Strip browser and profile decoration from a window title; never raises."""
     cleaned = (title or "").strip()
     cleaned = _TITLE_SUFFIX_RE.sub("", cleaned)
     cleaned = _TITLE_PROFILE_RE.sub("", cleaned)
@@ -312,22 +195,10 @@ def clean_window_title(title: str) -> str:
 
 
 def _label_is_unusable(name: str) -> bool:
-    """
-    True when a UIA element name cannot honestly be called a control label.
+    """True when a UIA name is a position indicator or page prose, not a control label.
 
-    Both cases were observed being copied verbatim into a finished document:
-
-      * a position indicator ("1 of 2") — a carousel's accessible name, which
-        produced "click the pane titled 1 of 2";
-      * a whole sentence or multi-line run — page prose, not a control label.
-
-    NOT checked here: "the name equals the page title", which is the shape of the
-    third observed failure ("click the document titled Sign in to your account").
-    That one is a `document`-node capture and is already excluded by the role
-    check in _describe_click, so testing the name as well only adds false
-    positives — a button labelled "Sign in" on a page titled "Sign In" is
-    perfectly legitimate and was being rejected. Let the role decide whether UIA
-    found a control; let this decide whether the name reads like a label.
+    Name-equals-page-title is deliberately left to _describe_click's role check,
+    which catches it without rejecting legitimate labels.
     """
     name = (name or "").strip()
     if not name:
@@ -338,28 +209,15 @@ def _label_is_unusable(name: str) -> bool:
 
 
 def _describe_click(event: dict) -> str:
-    """
-    Human-readable description of the interaction behind a screenshot event.
+    """Human-readable description of the interaction behind a screenshot event.
 
-    The clicked element captured at click time (data.ui_element, PRD F1) is the
-    most reliable signal in the pipeline WHEN IT LANDS ON A REAL CONTROL, and
-    misleading garbage when it doesn't. This function decides which of those
-    happened and says so, rather than handing everything to the model under one
-    "ground truth" banner — see the module docstring for what that cost.
-
-    Three outcomes:
-      * a named, actionable control  → present it and invite verbatim reuse;
-      * UIA answered with a container or unusable name → say explicitly that
-        there is no reliable name, and send the model to the screenshot;
-      * nothing captured at all → the click position only, as before.
+    Tells the model whether the captured control name is trustworthy, rather than
+    presenting every capture as ground truth.
     """
     data = event.get("data", {})
     click_type = data.get("click_type", "left")
 
     if click_type == "imported":
-        # Appended post-hoc via recorder/session.py::import_screenshots() —
-        # no click ever happened, so don't tell the model one did (e.g. a
-        # phone photo of a BIOS screen manually added to a session).
         return "manually imported photo (no click coordinates — added to this session after recording)"
 
     cx = data.get("click_x", "?")
@@ -383,9 +241,6 @@ def _describe_click(event: dict) -> str:
             f"the {role} named \"{name}\". This name is reliable; use it exactly."
         )
     else:
-        # Say WHY it's unreliable. Naming the container type is the difference
-        # between the model ignoring the hint and the model writing "click the
-        # pane titled 1 of 2".
         container = role or "an unnamed element"
         detail = f"it reported {container}" if role else "it reported nothing usable"
         desc += (
@@ -395,11 +250,8 @@ def _describe_click(event: dict) -> str:
             f"screenshot and describe it in your own words."
         )
         if name and not _POSITION_NAME_RE.match(name):
-            # Worth showing anyway: it is usually the text near or inside what was
-            # clicked, which helps the model work out WHAT happened. Framed as
-            # context-for-understanding rather than a name, because the model
-            # will quote anything presented as a name — and this text often
-            # contains whoever was signed in ("Hello, Jane Smith!").
+            # Framed as context, never as a name: the model quotes anything called a
+            # name, and this text often contains whoever was signed in.
             snippet = name if len(name) <= _MAX_LABEL_CHARS else name[:_MAX_LABEL_CHARS] + "…"
             desc += (
                 f" (text found at that spot, to help you understand what was "
@@ -408,10 +260,7 @@ def _describe_click(event: dict) -> str:
 
     cleaned_title = clean_window_title(window_title)
     if cleaned_title:
-        # Explicitly BEFORE the click. Titles are captured at click time, so on
-        # any click that navigates, this names the page being left — which is
-        # why the document once said "click Home in the New Incognito Tab
-        # window". The prompt forbids quoting it into step text.
+        # Captured at click time, so on a navigating click it names the page being left.
         desc += f" — window before this click: \"{cleaned_title}\""
     if ui.get("app_name"):
         desc += f" ({ui['app_name']})"
@@ -424,16 +273,27 @@ def _screenshot_event_blocks(event: dict, session_dir: Path, mode: str, config) 
     if img_path is None:
         return []
     offset_s = event["timestamp_offset_ms"] / 1000
-    return [
+    blocks = [
         {
             "type": "text",
             "text": (
                 f"[SCREENSHOT id={event['event_id']} at {offset_s:.1f}s — "
                 f"{_describe_click(event)}]:"
             ),
-        },
-        {"type": "image", "path": img_path},
+        }
     ]
+    note = event_note(event)
+    if note:
+        # Before the image: a note's job is to say what to look for in it.
+        blocks.append({
+            "type": "text",
+            "text": (
+                "[NOTE FROM THE PERSON WHO RECORDED THIS, about the screenshot "
+                f"below]: {note}"
+            ),
+        })
+    blocks.append({"type": "image", "path": img_path})
+    return blocks
 
 
 def _is_imported(event: dict) -> bool:
@@ -442,12 +302,9 @@ def _is_imported(event: dict) -> bool:
 
 
 def _format_duration(session_data: dict) -> str:
-    """
-    Recording length as "4m 12s", from the last event's offset.
+    """Recording length as "4m 12s", from the last event's offset.
 
-    Derived from the event timeline rather than started_at/stopped_at because
-    those are wall-clock and include the pause the user took to answer the phone,
-    which is not a fact about the procedure.
+    Not started_at/stopped_at: those are wall-clock and include idle pauses.
     """
     events = session_data.get("events", [])
     last_ms = max((e.get("timestamp_offset_ms", 0) for e in events), default=0)
@@ -455,24 +312,14 @@ def _format_duration(session_data: dict) -> str:
     return f"{total_s // 60}m {total_s % 60:02d}s"
 
 
-# Enough to show the shape of the journey without letting a 30-screenshot
-# session turn the preamble into a page of window titles.
+# Caps the preamble's app list on screenshot-heavy sessions.
 _MAX_OBSERVED_APPS = 12
 
 
 def _observed_applications(screenshots: list[dict]) -> tuple[list[str], int]:
-    """
-    Distinct "app — window title" pairs from the UIA capture, in first-seen order.
+    """Distinct "app — window title" pairs from the UIA capture, in first-seen order.
 
-    Returns (labels, how_many_were_dropped).
-
-    This is the highest-value thing in the preamble: it's the only place the model
-    learns what SYSTEM the procedure is about. The narration usually doesn't say
-    ("then I go to the student record"), because the person recording can see the
-    screen and doesn't think to name it.
-
-    Titles go through clean_window_title() — a list full of "- Google Chrome"
-    reads as noise, and the model copies what it is shown.
+    Returns (labels, number_dropped_over_the_cap).
     """
     seen: list[str] = []
     dropped = 0
@@ -493,20 +340,11 @@ def _observed_applications(screenshots: list[dict]) -> tuple[list[str], int]:
 
 
 def _session_preamble(session_data: dict, screenshots: list[dict]) -> str:
-    """
-    Context the recording already knows, as one leading text block.
-
-    Nothing here asks anything of the user — see the module docstring on why that
-    constraint is deliberate rather than lazy.
-    """
+    """Context the recording already knows, as one leading text block."""
     lines = ["[SESSION CONTEXT — background, not narration. Do not turn these into steps.]"]
 
     name = (session_data.get("name") or "").strip()
     if name:
-        # The name the person typed when they stopped recording. Often a better
-        # statement of intent than anything in the narration, which tends to
-        # start mid-thought — but it is a hint, not a mandate, because people
-        # also type "test 3".
         lines.append(f"- The person recording named this session: \"{name}\"")
 
     lines.append(f"- Recording length: {_format_duration(session_data)}")
@@ -521,6 +359,15 @@ def _session_preamble(session_data: dict, screenshots: list[dict]) -> str:
         )
     if not screenshots:
         lines.append("- No screenshots: the narration is your only source.")
+
+    noted = sum(1 for e in screenshots if event_note(e))
+    if noted:
+        lines.append(
+            f"- {noted} screenshot(s) carry a note written by the person who "
+            "recorded them, shown just above the image it belongs to. Treat those "
+            "as instructions about that screenshot, and do not quote them as "
+            "narration or copy them into the document verbatim."
+        )
 
     apps, dropped = _observed_applications(screenshots)
     if apps:
@@ -542,20 +389,10 @@ def _session_preamble(session_data: dict, screenshots: list[dict]) -> str:
 
 
 def build_content_blocks(session_data: dict, session_dir: Path, config) -> list[dict]:
-    """
-    Build the full list of neutral content blocks for a session. Screenshot
-    images are rendered (blur/circle/raw per the session's mode) into
-    session_dir/rendered/ and the rendered paths are what backends read.
+    """Blocks for a session: preamble, reviewed narration if any, the interleaved
+    timeline, then imported photos (which have no reliable timing) at the end.
 
-    Layout, in order:
-      1. the session preamble (name, duration, counts, observed applications);
-      2. the reviewed full narration, IF a restructuring edit produced one;
-      3. the timeline: narration segments and the screenshots taken during them,
-         interleaved by timestamp;
-      4. imported photos, grouped at the end — they have no real timing.
-
-    Sessions with no screenshots (transcript-only recordings) fall out of this
-    naturally: the returned list simply contains no image blocks.
+    Images are rendered per the session's mode; backends read the rendered paths.
     """
     events = session_data.get("events", [])
     edited_transcript = (session_data.get("edited_full_transcript") or "").strip()
@@ -572,11 +409,8 @@ def build_content_blocks(session_data: dict, session_dir: Path, config) -> list[
     segments = ordered_segments(session_data)
 
     if edited_transcript:
-        # A restructured transcript: authoritative on WORDING, useless for
-        # alignment. Say both things explicitly — the timeline below repeats this
-        # narration in its original segmentation, and without being told which to
-        # prefer the model treats the repetition as two different sources and
-        # sometimes documents the procedure twice.
+        # Authoritative on wording only; the timeline below repeats the same
+        # narration, so the model must be told explicitly which one wins.
         blocks.append({
             "type": "text",
             "text": (
@@ -596,7 +430,6 @@ def build_content_blocks(session_data: dict, session_dir: Path, config) -> list[
                 ),
             })
 
-    # The timeline proper. Imported photos are excluded here and appended below.
     timeline = sorted(
         [e for e in events
          if e.get("type") == "transcript_segment"

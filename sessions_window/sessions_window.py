@@ -1,34 +1,7 @@
-"""
-sessions_window/sessions_window.py — Sessions browser UI (PySide6).
+"""Sessions browser: list saved sessions, edit, generate, retranscribe, publish.
 
-A window listing all saved sessions. From here the user can:
-  • Edit  — opens the built-in session editor (sessions_window/session_editor.py)
-  • Generate documentation — sends the session to the configured backend
-  • Retranscribe — re-runs Whisper on the saved audio (recovery path for
-    sessions whose transcription failed or timed out)
-  • Record more / Delete
-
-There is no Export button. It produced an INSTRUCTIONS.md + images zip for
-someone to upload into Claude Desktop, which stopped making sense when the
-Anthropic backend was deleted on 2026-08-06: AutoDoc now talks only to the
-district's on-premises server, and a feature whose whole purpose was handing
-session content to an outside service contradicted that. It also carried a
-second, silently diverged copy of the generation prompt (no ground-truth element
-names, no screenshot-placement protocol), so the handoff produced worse
-documentation than pressing Generate — for reasons nobody would have guessed.
-Removed 2026-08-13 along with generation/exporter.py. The workflow it served
-("coworker records, admin generates") now needs a configured install rather than
-a zip; that is a deliberate loss, not an oversight.
-
-THREADING MODEL (do not regress — see ui_service.py for the full story):
-Widgets may only be touched from the Qt main thread. open_sessions_window()
-must therefore be called on it (the tray schedules it via
-ui_service.call_soon). Worker threads (generation, retranscribe) never touch
-widgets: they report back via ui_service.call_soon.
-
-STYLING: governed entirely by pyside6-ui-style-guide.md + theme/app.qss. This
-module sets object names and dynamic properties; it must never call
-setStyleSheet, name a color, or set a font.
+Widgets are touched only on the Qt main thread; worker threads report back
+through ui_service.call_soon().
 """
 
 import json
@@ -75,14 +48,12 @@ log = logging.getLogger(__name__)
 # Singleton: re-focus the existing window instead of stacking duplicates.
 _open_window: Optional["SessionsWindow"] = None
 
-# Fixed geometry from the style guide §6. Logical pixels — Qt scales for DPI.
+# Logical pixels; Qt scales for DPI.
 _MIN_W, _MIN_H = 760, 480
 _DEFAULT_W, _DEFAULT_H = 980, 600
 _ROW_HEIGHT = 28
 
-# Starting column widths. Every column is user-resizable from here (drag the
-# header divider); these are only the initial values. Wide enough for each
-# header's own text so nothing starts out elided.
+# Initial widths only; every column stays user-resizable.
 _COL_WIDTHS = {
     COL_NAME: 320,
     COL_DURATION: 88,
@@ -92,9 +63,7 @@ _COL_WIDTHS = {
 }
 
 
-# ------------------------------------------------------------------ #
-# Session discovery                                                    #
-# ------------------------------------------------------------------ #
+# ---- Session discovery ---- #
 
 def _load_sessions(config: AutoDocConfig) -> list[dict]:
     """Scan the sessions directory and return metadata for each valid session."""
@@ -144,9 +113,7 @@ def _load_sessions(config: AutoDocConfig) -> list[dict]:
     return results
 
 
-# ------------------------------------------------------------------ #
-# Entry point (must be called on the Qt main thread)                   #
-# ------------------------------------------------------------------ #
+# ---- Entry point (must be called on the Qt main thread) ---- #
 
 def open_sessions_window(
     config: AutoDocConfig,
@@ -155,24 +122,10 @@ def open_sessions_window(
     is_idle: Optional[Callable[[], bool]] = None,
     quit_for_update: Optional[Callable[[], None]] = None,
 ) -> None:
-    """
-    Open (or re-focus) the Sessions window.
+    """Open (or re-focus) the Sessions window on the Qt main thread.
 
-    Args:
-        config:        Loaded AutoDocConfig.
-        get_model:     Callable returning the tray's preloaded Whisper model,
-                       or None while it's still loading. Used by Retranscribe
-                       so we never load a duplicate model into memory.
-        start_resume:  Callable(session_dir) that begins append-recording into
-                       an existing session (PRD F5). Owned by TrayApp — only
-                       it may start recordings.
-        is_idle:       Callable() -> bool, True when TrayApp's state machine
-                       is IDLE. Settings tab's "Check for Updates" refuses to
-                       apply an update while a recording/transcription is in
-                       progress.
-        quit_for_update: Callable() that cleanly shuts AutoDoc down, called by
-                       the Settings tab immediately after it spawns the
-                       detached updater script (see updater.py).
+    get_model returns the tray's already-loaded Whisper model, or None while it
+    is still loading, so Retranscribe never loads a second copy.
     """
     global _open_window
     if _open_window is not None and _open_window.isVisible():
@@ -185,9 +138,7 @@ def open_sessions_window(
     _open_window.show()
 
 
-# ------------------------------------------------------------------ #
-# Window class                                                         #
-# ------------------------------------------------------------------ #
+# ---- Window class ---- #
 
 class SessionsWindow(QMainWindow):
     def __init__(
@@ -208,42 +159,21 @@ class SessionsWindow(QMainWindow):
         self._retranscribing = False
 
         self.setWindowTitle("AutoDoc — Sessions")
-        # setMinimumSize on the WINDOW is sanctioned (§6); the rule against it
-        # applies to inner widgets, where it's used to force layouts instead of
-        # fixing size policies.
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
         self._build_ui()
         self._refresh()
-        # Focus the table, not the first toolbar button. Without this, Refresh
-        # (the first focusable widget) takes initial focus and renders its
-        # :focus border, so it looks like a different button variant from "Open
-        # output folder" sitting right next to it — same variant, one just had a
-        # focus ring. The table is also the correct place for focus to start:
-        # it's the primary content, and arrow keys immediately do something
-        # useful.
         self._table.setFocus()
 
-    # ------------------------------------------------------------------ #
-    # UI construction                                                      #
-    # ------------------------------------------------------------------ #
+    # ---- UI construction ---- #
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         tabs.tabBar().setExpanding(False)
-        # False: QTabWidget::pane's border-top is the one seam line. Qt's own
-        # base line is drawn in Fusion's colour rather than a token and gets
-        # interrupted by the selected tab and the corner widget, which is what
-        # made it look like a partially cut-off line. See app.qss.
+        # app.qss draws the one seam line; Qt's own base line ignores the tokens.
         tabs.tabBar().setDrawBase(False)
-        # Refresh / Open output folder live in the tab bar's corner rather than
-        # in their own toolbar row below it. That row cost a full 28px of
-        # button plus a 12px gap — ~40px of stacked chrome above the table for
-        # two rarely-used actions, which is what made the header feel heavy.
-        # A corner widget shares the tab bar's existing 30px band instead, so
-        # the table starts immediately under the tabs.
         tabs.setCornerWidget(self._build_corner_actions(), Qt.Corner.TopRightCorner)
         self.setCentralWidget(tabs)
 
@@ -261,16 +191,11 @@ class SessionsWindow(QMainWindow):
         self._status = status
 
     def _build_corner_actions(self) -> QWidget:
-        """Quiet utility actions hosted in the tab bar's top-right corner."""
         corner = QWidget()
-        # Named so app.qss can paint its background. A bare QWidget in the
-        # tab-bar row paints nothing, and the strip above these buttons then
-        # renders as raw black — see #tabCornerActions in app.qss.
+        # Named so app.qss can paint its background; unstyled it renders black.
         corner.setObjectName("tabCornerActions")
         lay = QHBoxLayout(corner)
-        # 4px top margin matches QTabBar::tab's margin-top in app.qss so these
-        # buttons share the tabs' baseline instead of being clipped against the
-        # top edge of the window's client area.
+        # 4px top matches QTabBar::tab's margin-top, so these share the tabs' baseline.
         lay.setContentsMargins(0, 4, 0, 0)
         lay.setSpacing(8)
 
@@ -288,23 +213,15 @@ class SessionsWindow(QMainWindow):
     def _build_sessions_tab(self) -> QWidget:
         page = QWidget()
         root = QVBoxLayout(page)
-        # Panel-level margins (12), not window-level (16): this page sits
-        # *inside* the tab pane, which is itself inside the window's chrome, so
-        # 16 here stacked a second full window margin under the tab bar.
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
-        # ── Table (the ONE stretching child) ─────────────────────── #
         root.addWidget(self._build_table(), 1)
-
-        # ── Action bar (chrome — stretch 0) ──────────────────────── #
         root.addLayout(self._build_action_bar())
 
         return page
 
     def _build_table(self) -> QWidget:
-        # The container owns the border so the view can be NoFrame — avoids the
-        # doubled/partial outline you get when both draw one (§8, §9).
         container = QFrame()
         container.setProperty("panel", "true")
         lay = QVBoxLayout(container)
@@ -322,39 +239,28 @@ class SessionsWindow(QMainWindow):
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setWordWrap(False)
         table.setTextElideMode(Qt.ElideRight)
-        # Shrink by eliding + scrolling, never by forcing the window wider (§6).
         table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.doubleClicked.connect(lambda _idx: self._edit())
 
-        # Status pills.
         table.setItemDelegateForColumn(
             self._model.columnCount() - 1, StatusDelegate(table)
         )
 
-        # Fixed 28px rows — the descender rule (§4). Explicit, never implicit:
-        # letting Qt derive row height from font ascent is what clips y/g/p/Q.
+        # Explicit row height; letting Qt derive it from font ascent clips descenders.
         vh = table.verticalHeader()
         vh.setVisible(False)
         vh.setSectionResizeMode(QHeaderView.Fixed)
         vh.setDefaultSectionSize(_ROW_HEIGHT)
 
         hh = table.horizontalHeader()
-        # Sorting is NOT implemented, so the headers must not look or behave
-        # *clickable* — appearance and behaviour have to match (§9), otherwise
-        # they read as "buttons that do nothing". Resizing is a separate
-        # affordance: Interactive only adds a drag cursor on the divider, which
-        # does correspond to real behaviour, so it doesn't violate that rule.
+        # Sorting is not implemented, so the headers must not look clickable.
         hh.setSectionsClickable(False)
         hh.setSectionsMovable(False)
         hh.setHighlightSections(False)
         for col in range(self._model.columnCount()):
             hh.setSectionResizeMode(col, QHeaderView.Interactive)
             hh.resizeSection(col, _COL_WIDTHS.get(col, 100))
-        # Absorb leftover width into the final column so widening the window
-        # can't leave a dead gap to the right of the last header (§6). The
-        # status column is left-aligned pills, so extra room there is invisible
-        # — the same slack in a numeric column would look misaligned.
         hh.setStretchLastSection(True)
         hh.setFixedHeight(_ROW_HEIGHT)
 
@@ -363,10 +269,6 @@ class SessionsWindow(QMainWindow):
         return container
 
     def _build_action_bar(self) -> QHBoxLayout:
-        """
-        §6 order, exactly: [destructive] <stretch> [secondary…] [primary]
-        8px between adjacent buttons, 16px before the primary.
-        """
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 16, 0, 0)
         bar.setSpacing(8)
@@ -390,10 +292,6 @@ class SessionsWindow(QMainWindow):
         record_more_btn.clicked.connect(self._record_more)
         bar.addWidget(record_more_btn)
 
-        # Retry a failed push without paying for generation again. Lives here
-        # rather than in the editor because it operates on the selected session
-        # like every other button on this bar, and it needs no session content —
-        # generation/run.py cached the prepared markdown for exactly this.
         self._publish_btn = QPushButton("Publish to BookStack")
         self._publish_btn.clicked.connect(self._publish)
         bar.addWidget(self._publish_btn)
@@ -406,24 +304,13 @@ class SessionsWindow(QMainWindow):
         bar.addWidget(self._gen_btn)
         return bar
 
-    # ------------------------------------------------------------------ #
-    # Data helpers                                                         #
-    # ------------------------------------------------------------------ #
+    # ---- Data helpers ---- #
 
     def _set_status(self, text: str) -> None:
         self._status.showMessage(text)
 
     def _confirm(self, title: str, text: str) -> bool:
-        """
-        Yes/No confirmation. Returns True only on an explicit Yes.
-
-        Wrapped in one place, and fully explicit about both the button set and
-        the compared enum member, rather than relying on QMessageBox.question's
-        default buttons or on PySide6's forgiving `QMessageBox.Yes` shorthand.
-        Destructive actions (Delete, Retranscribe, Record more) route through
-        here, so an enum/API change can't silently start returning a truthy
-        value and skipping the prompt.
-        """
+        """Yes/No confirmation; returns True only on an explicit Yes."""
         answer = QMessageBox.question(
             self,
             title,
@@ -446,9 +333,7 @@ class SessionsWindow(QMainWindow):
             return None
         return self._model.session_at(rows[0].row())
 
-    # ------------------------------------------------------------------ #
-    # Actions                                                              #
-    # ------------------------------------------------------------------ #
+    # ---- Actions ---- #
 
     def _edit(self) -> None:
         session = self._selected_session()
@@ -465,19 +350,14 @@ class SessionsWindow(QMainWindow):
 
         from sessions_window.session_editor import open_editor_window
 
-        # Already on the Qt main thread — open directly.
         open_editor_window(
             session_data, session["session_dir"], self.config, self._generate_from_editor
         )
 
     def _generate_from_editor(self, session_data: dict, session_dir: Path) -> None:
         """Called by the editor when the user clicks Generate inside it."""
-        # Reload the list so counts reflect any deleted screenshots.
         self._refresh()
-        # The guard belongs here too, not just in _generate(): this used to be
-        # the one path into _run_generation that skipped it, so Generate from an
-        # editor could start a second concurrent run and leave _gen_btn's state
-        # owned by whichever finished last.
+        # This path used to skip the guard, allowing a second concurrent run.
         if self._generating:
             QMessageBox.information(self, "AutoDoc", "A generation is already in progress.")
             return
@@ -499,10 +379,6 @@ class SessionsWindow(QMainWindow):
         self._run_generation(session)
 
     def _run_generation(self, session: dict) -> None:
-        # No wait-cursor: generation runs in a worker thread and the rest of
-        # the app stays usable. (Note: with a LOCAL model on this same machine,
-        # inference can peg every CPU core — the app may still feel sluggish,
-        # but that's the model server's load, not blocking in here.)
         self._generating = True
         self._gen_btn.setEnabled(False)
         self._gen_btn.setText("Generating…")
@@ -538,17 +414,12 @@ class SessionsWindow(QMainWindow):
             msg = str(exc)
             ui_service.call_soon(lambda: self._on_generate_error(msg))
 
-    # ------------------------------------------------------------------ #
-    # BookStack publish / retry                                            #
-    # ------------------------------------------------------------------ #
+    # ---- BookStack publish / retry ---- #
 
     def _publish(self) -> None:
-        """
-        Push an already-generated session to BookStack (or retry a failed push).
+        """Push an already-generated session to BookStack, or retry a failed push.
 
-        Deliberately works even when bookstack_enabled is off — an explicit
-        button press is its own consent, and requiring a settings change first
-        would make "publish just this one" impossible.
+        Works even when bookstack_enabled is off; the button press is the consent.
         """
         session = self._selected_session()
         if not session:
@@ -566,8 +437,7 @@ class SessionsWindow(QMainWindow):
         self._set_status(f"Publishing '{session['name']}' to BookStack…")
 
         session_dir: Path = session["session_dir"]
-        # Force the publish regardless of the config flag: the user asked for it
-        # explicitly. Copy the config so the on-disk setting is untouched.
+        # A copy, so forcing the flag never touches the on-disk setting.
         cfg = replace(self.config, bookstack_enabled=True)
 
         def _work() -> None:
@@ -625,21 +495,10 @@ class SessionsWindow(QMainWindow):
         self._gen_btn.setText("Generate documentation")
 
     def _on_generated(self, output_path: Path, publish=None, truncated: bool = False) -> None:
-        """
-        Report a finished generation, INCLUDING the automatic publish outcome.
+        """Report a finished generation, including truncation and the publish outcome.
 
-        Reporting publish here is not cosmetic. It was originally omitted, and the
-        result was that an automatic publish could fail on every generation while
-        the app said only "Saved:" — the failure existed solely in autodoc.log, and
-        the same error looked like it "only happened" when the manual Publish
-        button was used (field report 2026-07-27). A step that can fail silently
-        will be assumed to have worked.
-
-        The same argument applies to `truncated`, and more sharply: a document
-        that stops at step 19 of 25 is the only failure mode that arrives looking
-        like a success. It is reported FIRST and it returns early — the file was
-        written and is worth opening, but nothing about a publish matters when the
-        document isn't finished (generation/run.py deliberately skipped it).
+        Truncation is reported first and returns early; a truncated document is
+        never published.
         """
         self._reset_gen_button()
         self._set_status(f"Saved: {output_path.name}")
@@ -699,14 +558,10 @@ class SessionsWindow(QMainWindow):
             f"Could not generate documentation.\n\nError:\n{error}",
         )
 
-    # ------------------------------------------------------------------ #
-    # Retranscribe                                                         #
-    # ------------------------------------------------------------------ #
+    # ---- Retranscribe ---- #
 
     def _retranscribe(self) -> None:
-        """Re-run Whisper on a session's saved audio. Recovery path for
-        sessions stuck without a transcript (status 'transcript_failed' or a
-        pre-fix 'recording'), but allowed on any session with audio."""
+        """Re-run Whisper on a session's saved audio; allowed on any session with audio."""
         if self._retranscribing:
             QMessageBox.information(self, "AutoDoc", "A retranscription is already in progress.")
             return
@@ -772,18 +627,12 @@ class SessionsWindow(QMainWindow):
                 data.get("started_at"),
             )
 
-            # Replace old transcript segments; keep everything else.
             events = [e for e in data.get("events", []) if e.get("type") != "transcript_segment"]
             events.extend(segments)
             data["events"] = sorted(events, key=lambda e: e.get("timestamp_offset_ms", 0))
             data["status"] = "ready"
-            # Every manual transcript edit is discarded here, and that is the
-            # point — the user confirmed it in the dialog above. Per-segment
-            # edits (`edited_text`) go automatically, because the segment events
-            # carrying them were just dropped and replaced. The blob has to be
-            # popped explicitly, since it lives on the session rather than on an
-            # event and would otherwise silently override the new transcript at
-            # generation time.
+            # The blob lives on the session, not on an event, so it must be popped
+            # explicitly or it would override the new transcript at generation time.
             data.pop("edited_full_transcript", None)
 
             tmp = json_path.with_suffix(".json.tmp")
@@ -817,9 +666,7 @@ class SessionsWindow(QMainWindow):
             f"Could not retranscribe this session.\n\nError:\n{error}",
         )
 
-    # ------------------------------------------------------------------ #
-    # Record More (PRD F5)                                                 #
-    # ------------------------------------------------------------------ #
+    # ---- Record More (PRD F5) ---- #
 
     def _record_more(self) -> None:
         """Append a new recording pass onto the selected session."""
@@ -856,9 +703,7 @@ class SessionsWindow(QMainWindow):
             f"Recording more into '{session['name']}' — stop from the tray icon, then Refresh."
         )
 
-    # ------------------------------------------------------------------ #
-    # Delete / Misc                                                        #
-    # ------------------------------------------------------------------ #
+    # ---- Delete / Misc ---- #
 
     def _delete(self) -> None:
         session = self._selected_session()
@@ -888,16 +733,11 @@ class SessionsWindow(QMainWindow):
         else:
             subprocess.Popen(["open", str(path.parent)])
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle                                                            #
-    # ------------------------------------------------------------------ #
+    # ---- Lifecycle ---- #
 
     def closeEvent(self, event) -> None:
-        """
-        Clear the module singleton and the ui_service main-window pointer so a
-        later "View sessions" builds a fresh window instead of trying to
-        raise() a deleted one, and so dialogs don't parent to a dead widget.
-        """
+        """Clear the singleton and ui_service pointer so a later open builds a fresh
+        window rather than raising a deleted one."""
         global _open_window
         _open_window = None
         if ui_service.get_main_window() is self:

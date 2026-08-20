@@ -1,66 +1,7 @@
-"""
-generation/renderers.py — Turn generated markdown into deliverable files:
-Markdown (with image links), self-contained HTML, and Word (.docx), each with
-the session's screenshots embedded at the steps they illustrate (PRD F2).
+"""Renders a prepared document to .md, self-contained .html and .docx.
 
-Screenshot placement contract:
-The generator's system prompt instructs the model to place screenshots using
-tokens of the form `{{screenshot:evt_0004}}` on their own line. This module:
-  - resolves each valid token to that event's RENDERED image (respecting the
-    session's render mode and redaction regions via render_event_to_cache),
-  - keeps only the FIRST occurrence of each id, strips unknown/duplicate tokens,
-  - appends any screenshots the model didn't place under a final
-    "Screen reference" heading, so images are never silently lost — an
-    imperfect model degrades to "all images at the end", not "no images".
-
---------------------------------------------------------------------------
-THE PARSER AND THE PROMPT ARE ONE CONTRACT — CHANGE THEM TOGETHER
---------------------------------------------------------------------------
-
-The markdown→HTML/docx conversion is deliberately NOT a general markdown engine.
-It understands exactly what the prompt in generation/content.py permits:
-
-    headings (H1–H4), paragraphs, bulleted lists (nested), numbered lists
-    (nested), pipe tables with a header row, **bold**, *italic*, `inline code`,
-    and whole-line {{screenshot:id}} tokens.
-
-and nothing else. Fenced code blocks, block quotes, horizontal rules,
-underscore emphasis and raw HTML are NOT parsed, which is why the prompt names
-them and tells the model not to emit them.
-
-**Keep those two lists in step.** Widening the prompt without widening
-_iter_blocks() is the one strictly-bad combination: an unparsed construct is not
-dropped, it is passed through as a paragraph, so a table the renderer doesn't
-understand reaches the reader as a row of literal pipe characters in a Word
-document. That is exactly why nested lists and tables were added here FIRST
-(2026-08-13) and the prompt loosened afterwards, rather than the other way round.
-
-BookStack is not affected by any of this and never was: publish/ sends
-`prepared.doc` as markdown and BookStack renders it server-side, so richer
-markdown always worked there. The local md/html/docx writers were the only
-bottleneck — worth remembering if output ever looks better on the wiki than in
-the Word file.
-
-PUBLIC API — two steps, deliberately separate:
-
-    prepared = prepare_document(markdown, session_data, session_dir, config)
-    paths    = write_outputs(prepared, session_data, config, output_dir)
-
-prepare_document() does the model-output normalization ONCE and hands back a
-PreparedDocument. Every consumer of generated documentation — the file writers
-here, and any publishing destination (see PRD-v1.3-bookstack.md) — must go
-through it rather than re-parsing the model's raw markdown. Two reasons, both
-learned the hard way:
-
-  1. _hoist_inline_tokens() is what makes weaker models' inline token placement
-     render at all. A consumer that parses raw markdown silently drops images.
-  2. PreparedDocument.images is whatever render_event_to_cache() returns — the
-     session's render mode, click circle, and redaction regions already applied.
-     A consumer that resolves its own image paths from screenshots/ would emit
-     un-redacted originals while the local .docx looked correct. (Note
-     render_event_to_cache legitimately returns the source path itself when
-     there is nothing to apply — raw mode with no redactions — so "always use
-     what it returned" is the rule, not "never touch screenshots/".)
+_iter_blocks() must parse exactly the markdown subset generation/content.py's prompt
+permits; anything wider reaches the reader as raw pipes and asterisks.
 """
 
 import base64
@@ -81,23 +22,13 @@ _TOKEN_RE = re.compile(r"\{\{screenshot:([\w-]+)\}\}")
 VALID_FORMATS = ("md", "html", "docx")
 
 
-# ------------------------------------------------------------------ #
-# Public entry points                                                  #
-# ------------------------------------------------------------------ #
-
 @dataclass
 class PreparedDocument:
-    """
-    Generated documentation, normalized once and ready for any destination.
+    """Generated documentation, normalized once and ready for any destination.
 
-    doc     — markdown whose remaining {{screenshot:id}} tokens are guaranteed
-              valid, unique, and alone on their own line.
-    images  — event_id → render_event_to_cache() path, chronological. Render mode
-              and redaction regions already applied. Use these paths as given;
-              don't re-resolve from screenshots/.
-    stem    — filesystem-safe filename stem (no extension).
-    title   — the document's H1 as written, for destinations that want a human
-              title rather than a filename. Empty if the model omitted an H1.
+    `doc`'s remaining tokens are valid, unique and alone on their line. `images`
+    paths already have render mode and redactions applied — use them as given
+    rather than re-resolving from screenshots/.
     """
 
     doc: str
@@ -112,34 +43,22 @@ def prepare_document(
     session_dir: Path,
     config,
 ) -> PreparedDocument:
-    """
-    Normalize raw model output into a PreparedDocument.
-
-    Call this exactly once per generation and pass the result to every
-    destination — see this module's docstring for why re-parsing the raw
-    markdown downstream is a defect, not a shortcut.
-    """
+    """Normalize raw model output once per generation; every destination uses the result."""
     fallback = session_data.get("session_id", "session")
     images = _resolve_images(session_data, session_dir, config)
     return PreparedDocument(
         doc=_normalize_tokens(markdown, images),
         images=images,
-        # Both derived from the RAW markdown: _normalize_tokens only touches
-        # screenshot tokens, but deriving from it would couple the output
-        # filename to token-hoisting behaviour for no reason.
+        # From the RAW markdown, so the filename can't depend on token hoisting.
         stem=_derive_stem(markdown, fallback),
         title=_derive_title(markdown),
     )
 
 
 def substitute_tokens(doc: str, resolve) -> str:
-    """
-    Replace every {{screenshot:id}} token via resolve(event_id) -> str.
+    """Replace every {{screenshot:id}} token via resolve(event_id) -> str.
 
-    Public so destinations don't each carry their own copy of the token regex —
-    the pattern belongs in exactly one place. Return "" from resolve to strip a
-    token (used for the placeholder body BookStack needs before its images can be
-    uploaded).
+    Returning "" from resolve strips the token.
     """
     return _TOKEN_RE.sub(lambda m: resolve(m.group(1)), doc)
 
@@ -150,18 +69,10 @@ def write_outputs(
     config,
     output_dir: Path,
 ) -> list[Path]:
-    """
-    Write a PreparedDocument in every configured output format.
+    """Write a PreparedDocument into output_dir/<session name>/, one format each.
 
-    Returns the list of written paths (first = primary, shown in the UI).
-    Raises only if NO format could be written; individual format failures
-    are logged and skipped so one bad exporter can't destroy a generation
-    that cost real time and tokens.
-
-    Files land in output_dir/<session name>/ — one subfolder per session, so
-    multi-format output (plus the md's images folder) doesn't pile every
-    session's files into one flat directory. Re-generating the same session
-    reuses its folder; filename collisions get _1/_2 suffixes as before.
+    Returns the written paths (first = primary). Individual format failures are
+    logged and skipped; raises only when every format failed.
     """
     session_label = session_data.get("name") or session_data.get("session_id", "session")
     output_dir = output_dir / _safe_dirname(session_label)
@@ -196,9 +107,7 @@ def write_outputs(
     return written
 
 
-# ------------------------------------------------------------------ #
-# Document preparation                                                 #
-# ------------------------------------------------------------------ #
+# --- Document preparation ---
 
 def _resolve_images(session_data: dict, session_dir: Path, config) -> dict:
     """event_id → rendered image Path, in chronological order (dicts preserve it)."""
@@ -216,12 +125,8 @@ def _resolve_images(session_data: dict, session_dir: Path, config) -> dict:
 
 
 def _normalize_tokens(markdown: str, images: dict) -> str:
-    """
-    Normalize the model's token usage:
-      - keep the first occurrence of each KNOWN id, drop later duplicates,
-      - strip tokens for unknown ids entirely,
-      - append unused screenshots under a "Screen reference" heading.
-    Output is markdown whose remaining tokens are guaranteed valid and unique.
+    """Keep the first occurrence of each known id, strip unknown and duplicate tokens,
+    and append screenshots the model never placed under a "Screen reference" heading.
     """
     seen: set[str] = set()
 
@@ -254,16 +159,10 @@ _EMPTY_PAREN_RE = re.compile(r"\(\s*(?:see|refer to|shown in|as shown)?\s*[,;:]?
 
 
 def _hoist_inline_tokens(doc: str) -> str:
-    """
-    Move tokens embedded mid-sentence onto their own lines.
+    """Move tokens embedded mid-sentence onto their own lines.
 
-    Models — especially weaker local ones — routinely write
-    "…enter the login name. (See {{screenshot:evt_0004}})." despite the
-    prompt requiring tokens alone on a line. The block parser below only
-    treats whole-line tokens as images, so without this pass inline tokens
-    rendered as literal text in HTML/docx (observed in the field 2026-07-13,
-    while the markdown writer's global regex substitution masked the problem
-    in .md output). Hoisting also tidies the leftover "(See )" debris.
+    Models write them inline despite the prompt, and _iter_blocks() only treats a
+    whole-line token as an image.
     """
     out: list[str] = []
     for line in doc.splitlines():
@@ -277,8 +176,8 @@ def _hoist_inline_tokens(doc: str) -> str:
             continue
         text = _TOKEN_RE.sub("", line)
         text = _EMPTY_PAREN_RE.sub("", text)      # "(See )." → gone
-        text = re.sub(r"\s+([.,;:!?])", r"\1", text)  # " ." → "."
-        text = re.sub(r"\.{2,}", ".", text)       # ".." → "."
+        text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+        text = re.sub(r"\.{2,}", ".", text)
         text = re.sub(r"\s{2,}", " ", text).rstrip()
         if text.strip():
             out.append(text)
@@ -290,19 +189,13 @@ def _hoist_inline_tokens(doc: str) -> str:
     return "\n".join(out)
 
 
-# ------------------------------------------------------------------ #
-# Block parsing                                                        #
-# ------------------------------------------------------------------ #
+# --- Block parsing ---
 
-# A bullet needs whitespace AFTER the marker, which is what keeps a line
-# starting "**Note**" from being read as a list item.
+# The required whitespace after the marker keeps "**Note**" from matching.
 _UL_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*+][ \t]+(?P<text>.*)$")
 _OL_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)\d{1,3}[.)][ \t]+(?P<text>.*)$")
-# Horizontal rules and setext underlines. Dropped rather than rendered: the
-# prompt asks the model not to emit them, and a literal row of dashes in a Word
-# document is worse than a missing separator. A setext "Title\n-----" therefore
-# degrades to a plain paragraph, which is the right trade for output that is
-# supposed to use ATX headings.
+# Rules and setext underlines, dropped rather than rendered: a literal row of
+# dashes in a Word document is worse than a missing separator.
 _RULE_RE = re.compile(r"^[-*_=]{3,}$")
 
 
@@ -325,14 +218,10 @@ def _match_list_item(raw_line: str) -> dict | None:
 
 
 def _assign_levels(items: list[dict]) -> list[dict]:
-    """
-    Turn raw indent widths into 0-based nesting levels with an indent stack.
+    """Turn raw indent widths into 0-based nesting levels.
 
-    Width-agnostic on purpose. Models are wildly inconsistent about whether a
-    sublist is indented 2, 3 or 4 spaces, and mix widths inside one list; all
-    that is treated as meaningful is whether an item is indented MORE than the
-    one above it. So 2-space and 4-space nesting both come out as level 1, and a
-    ragged list still nests the way it looks.
+    Only relative indent matters, because models mix 2-, 3- and 4-space nesting
+    inside one list.
     """
     stack: list[int] = []
     out: list[dict] = []
@@ -351,12 +240,7 @@ def _assign_levels(items: list[dict]) -> list[dict]:
 
 
 def _is_table_delimiter(line: str) -> bool:
-    """
-    True for a pipe-table separator row like `|---|:--:|`.
-
-    Requiring a pipe is what distinguishes it from a horizontal rule, and
-    requiring a dash is what distinguishes it from an ordinary short row.
-    """
+    """True for a pipe-table separator row like `|---|:--:|`."""
     stripped = line.strip()
     if "|" not in stripped or "-" not in stripped:
         return False
@@ -385,14 +269,10 @@ def _parse_alignments(delimiter: str, width: int) -> list[str | None]:
 
 
 def _try_parse_table(lines: list[str], start: int) -> tuple[dict, int] | None:
-    """
-    Parse a pipe table beginning at `start`, or None.
+    """Parse a pipe table beginning at `start`, returning (block, lines_consumed) or None.
 
-    Returns (block, lines_consumed). The separator row is REQUIRED — without it
-    an ordinary sentence containing a pipe would be swallowed as a one-row table.
-    Ragged rows are padded and over-long rows truncated to the header's width, so
-    a model that miscounts cells still produces a readable table instead of an
-    exception inside the docx writer.
+    The separator row is required, or a sentence containing a pipe becomes a table;
+    rows are padded or truncated to the header width.
     """
     if start + 1 >= len(lines):
         return None
@@ -425,8 +305,7 @@ def _next_content_is_list_item(lines: list[str], start: int) -> bool:
 
 
 def _iter_blocks(doc: str):
-    """
-    Yield (kind, payload) blocks from the model's markdown:
+    """Yield (kind, payload) blocks from the model's markdown:
 
       ("heading", (level, text))
       ("list",    [{"level": int, "ordered": bool, "text": str}, ...])
@@ -434,14 +313,7 @@ def _iter_blocks(doc: str):
       ("image",   event_id)
       ("para",    text)
 
-    This is still not a general markdown engine, but it is no longer the
-    five-case switch it was before 2026-08-13 — nested lists, ordered lists and
-    pipe tables are parsed, because the prompt now permits them. What it still
-    does NOT handle: fenced code blocks, block quotes, and HTML, all of which the
-    prompt explicitly tells the model not to emit. Keep those two lists in step:
-    a construct the prompt allows but this function doesn't understand lands in
-    the finished .docx as raw pipe characters and asterisks, which is the one
-    genuinely bad combination.
+    Not a general markdown engine: fenced code, block quotes and HTML are not parsed.
     """
     lines = doc.splitlines()
     index = 0
@@ -452,9 +324,7 @@ def _iter_blocks(doc: str):
         line = raw_line.strip()
 
         if not line:
-            # A blank line between two list items is a "loose list", not the end
-            # of one — and models routinely put one before a sublist. Ending the
-            # list here would render the sublist as a separate top-level list.
+            # A blank line between items is a loose list, not the end of one.
             if pending and _next_content_is_list_item(lines, index + 1):
                 index += 1
                 continue
@@ -501,16 +371,11 @@ def _iter_blocks(doc: str):
         yield ("list", _assign_levels(pending))
 
 
-# ------------------------------------------------------------------ #
-# Inline formatting                                                    #
-# ------------------------------------------------------------------ #
+# --- Inline formatting ---
 
-# Bold BEFORE italic so `**x**` isn't consumed by the single-asterisk branch;
-# the lookarounds on the italic branch are belt-and-braces for the same thing.
-#
-# Underscore emphasis (_x_) is deliberately NOT supported: this documentation is
-# full of file paths and field names like some_field_name, and treating those as
-# emphasis would silently eat the underscores. Asterisks only.
+# Bold BEFORE italic so `**x**` isn't consumed by the single-asterisk branch.
+# Underscore emphasis is unsupported on purpose: it would eat the underscores in
+# field names like some_field_name.
 _INLINE_RE = re.compile(
     r"\*\*(?P<bold>.+?)\*\*"
     r"|(?<!\*)\*(?P<italic>[^*\n]+?)\*(?!\*)"
@@ -540,9 +405,7 @@ def _strip_inline(text: str) -> str:
     return "".join(chunk for chunk, _b, _i, _c in _iter_inline(text))
 
 
-# ------------------------------------------------------------------ #
-# Markdown                                                             #
-# ------------------------------------------------------------------ #
+# --- Markdown ---
 
 def _write_md(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
     path = _unique_path(output_dir / f"{stem}.md")
@@ -565,9 +428,7 @@ def _write_md(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
     return path
 
 
-# ------------------------------------------------------------------ #
-# Self-contained HTML                                                  #
-# ------------------------------------------------------------------ #
+# --- Self-contained HTML ---
 
 _HTML_SHELL = """<!DOCTYPE html>
 <html lang="en">
@@ -602,13 +463,10 @@ _HTML_SHELL = """<!DOCTYPE html>
 
 
 def _list_html(items: list[dict]) -> str:
-    """
-    Nested <ul>/<ol> from the flat level-tagged items.
+    """Nested <ul>/<ol> from the flat level-tagged items.
 
-    A sublist is emitted as a SIBLING of its parent <li> rather than nested
-    inside it. That is not spec-perfect markup, but every browser indents it
-    identically, and these files are read-only artifacts rather than input to
-    anything that would care.
+    A sublist is emitted as a sibling of its parent <li>, not inside it; browsers
+    indent both identically.
     """
     parts: list[str] = []
     open_tags: list[str] = []
@@ -686,9 +544,7 @@ def _inline_html(text: str) -> str:
     return "".join(out)
 
 
-# ------------------------------------------------------------------ #
-# Word (.docx)                                                         #
-# ------------------------------------------------------------------ #
+# --- Word (.docx) ---
 
 # Deepest built-in "List Bullet N" style in python-docx's default template.
 _DOCX_MAX_LIST_LEVEL = 2
@@ -697,8 +553,7 @@ _DOCX_INDENT_STEP_IN = 0.25
 
 
 def _write_docx(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
-    # Imported here so a broken python-docx install only breaks docx export,
-    # not md/html (write_outputs skips failed formats).
+    # Imported here so a broken python-docx install only breaks docx export.
     from docx import Document
     from docx.shared import Inches
 
@@ -733,27 +588,18 @@ def _add_docx_runs(para, text: str, force_bold: bool = False) -> None:
 
 
 def _add_docx_list(document, items: list[dict]) -> None:
-    """
-    Write a nested list.
+    """Write a nested list.
 
-    Bulleted items use Word's built-in "List Bullet" / "List Bullet 2" / "List
-    Bullet 3" styles. NUMBERED items deliberately do not use "List Number": Word
-    numbering definitions are shared across the document, so consecutive
-    List Number paragraphs keep counting — a second numbered list under the next
-    step would start at 4 instead of 1, and there is no way to say "restart here"
-    through python-docx's public API (it needs hand-written numbering XML, which
-    is exactly the kind of thing that behaves differently in a frozen build).
-    So the number is written as literal text with a matching indent. Not a
-    semantic Word list, but the digits a reader sees are always right, and these
-    documents are read rather than edited further.
+    Numbered items are literal text plus an indent, not Word's "List Number" style:
+    that style shares one numbering definition per document, so a later list would
+    continue counting instead of restarting at 1.
     """
     from docx.shared import Inches
 
     counters: dict[int, int] = {}
     for item in items:
         level = min(item["level"], _DOCX_MAX_LIST_LEVEL)
-        # Returning to a shallower level (or hitting a bullet) invalidates the
-        # counters below it, so the next sublist starts at 1 again.
+        # Drop counters below this level so the next sublist restarts at 1.
         for deeper in [key for key in counters if key > level]:
             del counters[deeper]
 
@@ -771,8 +617,7 @@ def _add_docx_list(document, items: list[dict]) -> None:
             try:
                 para = document.add_paragraph(style=style)
             except KeyError:
-                # Template without the deeper styles: fall back to level 1 and
-                # fake the depth with an indent rather than losing the item.
+                # Template without the deeper styles: fake the depth with an indent.
                 para = document.add_paragraph(style="List Bullet")
                 para.paragraph_format.left_indent = Inches(
                     _DOCX_INDENT_STEP_IN * (level + 1)
@@ -785,8 +630,7 @@ def _add_docx_table(document, block: dict) -> None:
     header = block["header"]
     table = document.add_table(rows=1, cols=len(header))
     try:
-        # The one border style guaranteed present in python-docx's default
-        # template. Without it a Word table has no visible gridlines at all.
+        # Without a border style a Word table has no visible gridlines.
         table.style = "Table Grid"
     except KeyError:
         pass
@@ -820,9 +664,7 @@ def _align_docx_para(para, align: str | None) -> None:
         pass
 
 
-# ------------------------------------------------------------------ #
-# Filename helpers (moved from output_writer, semantics unchanged)      #
-# ------------------------------------------------------------------ #
+# --- Filename helpers ---
 
 def _safe_dirname(name: str) -> str:
     """Session name → filesystem-safe output folder name."""
@@ -840,20 +682,13 @@ def _iter_h1_titles(markdown: str):
 
 
 def _derive_title(markdown: str) -> str:
-    """
-    The document's first H1 exactly as the model wrote it, or "" if there is none.
-
-    Kept separate from _derive_stem because a filename stem is not a title:
-    "Reset a Locked Account" becomes "Reset_a_Locked_Account" as a stem, which is
-    correct on disk and wrong as a page heading anywhere else.
-    """
+    """The document's first H1 exactly as the model wrote it, or "" if there is none."""
     return next((t for t in _iter_h1_titles(markdown) if t), "")
 
 
 def _derive_stem(markdown: str, fallback: str) -> str:
     """Extract the H1 heading and convert it to a safe filename stem."""
-    # Keeps the original semantics: an H1 that sanitizes to nothing (e.g. one
-    # made entirely of punctuation) falls through to the next H1, not to fallback.
+    # An H1 that sanitizes to nothing falls through to the next H1, not to fallback.
     for title in _iter_h1_titles(markdown):
         safe = re.sub(r"[^\w\s-]", "", title)
         safe = re.sub(r"[\s]+", "_", safe.strip())

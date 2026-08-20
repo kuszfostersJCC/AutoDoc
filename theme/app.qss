@@ -1,19 +1,8 @@
-/* theme/app.qss — the one and only stylesheet. Loaded by theme/loader.py.
- *
- * Placeholders are substituted from theme/tokens.py via string.Template.
- * (Written without a literal placeholder example so that an audit for
- * unresolved placeholders after substitution comes back clean.)
- * Grouped by widget class in a FIXED order (§5.9) — later rules win at equal
- * specificity, so never reorder these groups to "fix" something; add the
- * missing state instead.
- *
- * Rules that bite if forgotten:
- *   - Hover/pressed may change background-color and color ONLY. Any
- *     border-width/padding/margin/font change on hover causes visible jitter.
- *   - Styling a class means styling ALL its states and subcontrols, or Fusion
- *     draws the rest and you get half-custom/half-native widgets.
- *   - Popups (QMenu, QComboBox QAbstractItemView, QToolTip) inherit nothing
- *     useful and must each be styled explicitly.
+/* theme/app.qss — the one and only stylesheet; placeholders are substituted from
+ * theme/tokens.py by theme/loader.py. Grouped by widget class in a fixed order
+ * (§5.9): later rules win at equal specificity, so add a missing state rather
+ * than reordering. Hover/pressed change colour only — a border or padding change
+ * on hover causes visible jitter.
  */
 
 QWidget {
@@ -40,9 +29,8 @@ QFrame[panel="true"] {
     border: $border_width solid $border;
     border-radius: 0px;            /* never round an image container */
 }
-/* Marked-for-deletion state. Set via a dynamic property rather than a
- * per-widget stylesheet; because the property changes AFTER the widget is
- * shown, the setter MUST unpolish/polish or Qt won't re-evaluate the rule. */
+/* Dynamic property, changed after the widget is shown, so the setter must
+ * unpolish/polish or Qt won't re-evaluate this rule. */
 #thumbCard[marked="true"] {
     background-color: $danger_subtle;
     border-color: $danger;
@@ -56,40 +44,18 @@ QTabWidget::pane {
     border-top: $border_width solid $border;
     background-color: $bg_window;
 }
-/* The tab bar paints bg_window EXPLICITLY — it must not be transparent.
- * Transparent leaves the band around the tabs unpainted, and in document mode
- * nothing behind it paints either, so the strip renders as raw black. That was
- * the "dark line cut off at the top of the window" artifact: not a border, not
- * a design element, just an unpainted region that became visible once the tabs
- * got a 4px top margin. The corner widget needs the same treatment — see
- * #tabCornerActions below. */
-/* drawBase 0, NOT 1. Two things were drawing the seam under the tab bar: Qt's
- * native tab-bar base line (drawBase) AND QTabWidget::pane's border-top. The
- * base line is painted by Fusion in ITS colour, not a token, so it read as a
- * darker line that the selected tab and the corner widget's background each
- * interrupted — a line that looks "cut off" in places. The style guide warns
- * about exactly this pairing ("mismatched base/pane borders are what produced
- * the weird partial outline"). The pane's border-top is now the single source
- * of that seam, in $border.
- *
- * If a full-width line under the tab bar ever goes missing entirely, this is
- * the knob — but fix it by checking the pane's border-top, not by turning the
- * base back on. */
+/* Must paint bg_window explicitly: transparent leaves the band around the tabs
+ * unpainted, which renders as raw black in document mode. drawBase 0 so the
+ * pane's border-top is the single source of the seam under the tab bar (Fusion
+ * paints its base line in its own colour, not a token). */
 QTabBar { qproperty-drawBase: 0; background-color: $bg_window; }
-/* Same reason: the corner widget hosting Refresh / Open output folder is a bare
- * QWidget in the tab-bar row, and its 4px margin strip showed the same black
- * band until it painted its own background. */
+/* Bare QWidget in the tab-bar row: same unpainted-band problem as QTabBar. */
 #tabCornerActions { background-color: $bg_window; }
 QTabBar::tab {
     min-height: 30px;
     padding: 0 16px;
-    /* 4px top margin, NOT 0. With no margin the tab bar sits flush against the
-     * top edge of the window's client area and the top pixel row of each tab
-     * (and of the corner-widget buttons beside them) gets clipped — it reads as
-     * the tabs overlapping the window frame. The margin also grows the tab-bar
-     * band so the 28px corner buttons are no longer squeezed into a 30px row.
-     * sessions_window.py gives the corner widget a matching 4px top margin so
-     * the two stay on the same baseline. */
+    /* 4px, not 0: with no margin the top pixel row of each tab is clipped.
+     * sessions_window.py matches it on the corner widget. */
     margin: 4px 0 0 0;
     background: transparent;
     color: $text_muted;
@@ -100,23 +66,15 @@ QTabBar::tab {
 }
 QTabBar::tab:hover:!selected { background-color: $bg_subtle; }
 QTabBar::tab:selected {
-    /* bg_surface stated explicitly (§9: "Active tab: bg_surface fill"). Left
-     * transparent, the white came from Fusion drawing its own native tab shape
-     * underneath — which also drew the native tab's left/top/right edges, the
-     * boxed-in look on the selected tab. Painting it ourselves covers that. */
+    /* Explicit fill covers Fusion's native tab shape, whose edges gave the
+     * selected tab a boxed-in outline. */
     background-color: $bg_surface;
     color: $text;
     border-bottom: 2px solid $accent;
 }
-/* Tabs are keyboard-navigable, and heavy QSS suppresses Fusion's native focus
- * rect — without this, tabbing to the tab bar gives no visible indication.
- * Uses background only: the 2px bottom border is the selected-tab signal and
- * changing border geometry on focus would shift the tab by a pixel.
- *
- * :!selected is REQUIRED. This rule sits after :selected at equal specificity,
- * so without the negation it wins on a tab that is both selected and focused —
- * which is every tab the moment you click it — repainting the active tab
- * bg_subtle grey instead of bg_surface white. */
+/* Heavy QSS suppresses Fusion's focus rect, so keyboard focus needs its own
+ * fill. :!selected is required — this rule sits after :selected at equal
+ * specificity and would otherwise win on any tab you click. */
 QTabBar::tab:focus:!selected { background-color: $bg_subtle; color: $text; }
 QTabBar::tab:disabled { color: $text_disabled; }
 
@@ -224,13 +182,8 @@ QComboBox QAbstractItemView::item:selected {
     color: $text_on_accent;
     border-radius: $radius_control;
 }
-/* Editable combo box (Settings → Local model: type an id or pick one).
- * An editable QComboBox contains a real child QLineEdit, which would
- * otherwise inherit the QLineEdit rule above and draw a SECOND bordered,
- * rounded, 28px-min-height box inside the combo — the "grey box in a white
- * box" / doubled-border look. Neutralising the child is mandatory, not
- * cosmetic. Comes after the QLineEdit block deliberately; the descendant
- * selector also out-specifies it, so both orderings are safe. */
+/* An editable QComboBox contains a real child QLineEdit, which would otherwise
+ * inherit the rule above and draw a second bordered box inside the combo. */
 QComboBox:editable          { background-color: $bg_surface; }
 QComboBox:editable:disabled { background-color: $bg_subtle; }
 QComboBox QLineEdit {
@@ -244,23 +197,15 @@ QComboBox QLineEdit {
 }
 QComboBox QLineEdit:disabled { color: $text_disabled; }
 
-/* Settings fields holding long values (a URL, a GGUF-derived model id). These
- * need real width to be readable — at the default sizeHint the endpoint
- * truncated to "http://172.20.28.2(" and the model id to "4b-fast". Set here
- * via object name rather than setMinimumWidth in Python, which is the
- * sanctioned way to make one widget differ (§1.2) and keeps sizes in the
- * theme. They are minimums, so the fields still shrink gracefully with the
- * window rather than pinning it wider. */
+/* Long values (endpoint URL, model id) truncate at the default sizeHint. Set by
+ * object name rather than setMinimumWidth in Python, per §1.2. */
 #settingsEndpoint { min-width: 320px; }
 #settingsModel    { min-width: 240px; }
+#settingsAudioDevice { min-width: 260px; }
 
 /* ---- Splitter (session editor: transcript | screenshots) ----
- * The handle is a TRANSPARENT 8px gutter, not a painted bar. A solid 4px grey
- * bar sat flush against both panes with a 0px gap, so it read as a divider
- * jammed into the text beside it. 8px of empty space separates the panes
- * cleanly and simultaneously gives a bigger drag target; the fill only appears
- * on hover/press, which is also the affordance that says "this is draggable".
- * Colour-only state changes, so nothing shifts by a pixel on hover (§5.3). */
+ * A transparent 8px gutter, not a painted bar: it separates the panes and gives
+ * a bigger drag target, and the fill on hover/press is the drag affordance. */
 QSplitter { background: transparent; }
 QSplitter::handle            { background-color: transparent; }
 QSplitter::handle:horizontal { width: 8px; }
@@ -278,9 +223,7 @@ QCheckBox::indicator {
     border-radius: 3px;
 }
 QCheckBox::indicator:unchecked:hover { border-color: $accent_focus; }
-/* Keyboard focus must be visible on the indicator — a focused checkbox with
- * no outline is invisible to anyone tabbing through the form. Border COLOR
- * only; changing border-width here would resize the 16px indicator. */
+/* Border colour only; a border-width change would resize the 16px indicator. */
 QCheckBox::indicator:focus { border-color: $accent_focus; }
 QCheckBox::indicator:checked {
     background-color: $accent;
@@ -326,8 +269,7 @@ QHeaderView::section {
 QHeaderView::section:last { border-right: none; }
 QTableCornerButton::section { background-color: $bg_subtle; border: none; }
 
-/* ---- Menus (tray context menu — a separate top-level widget, inherits
- *      nothing from the rules above) ---- */
+/* ---- Menus (top-level widgets; inherit nothing from the rules above) ---- */
 QMenu {
     background-color: $bg_surface;
     color: $text;
@@ -359,9 +301,7 @@ QScrollBar::handle:vertical {
     border-radius: 6px; margin: 2px;
 }
 QScrollBar::handle:vertical:hover { background-color: $text_muted; }
-/* Dragging must look different from hovering, or the scrollbar feels dead
- * while you're actually holding it. Color only — margin/radius changes here
- * would make the handle appear to resize mid-drag. */
+/* Colour only, so the handle doesn't appear to resize mid-drag. */
 QScrollBar::handle:vertical:pressed { background-color: $text; }
 QScrollBar:horizontal {
     background: transparent; height: 12px; margin: 0;
