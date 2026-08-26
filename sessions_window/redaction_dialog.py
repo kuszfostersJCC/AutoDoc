@@ -9,7 +9,7 @@ import logging
 from typing import Callable, Optional
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -26,8 +26,18 @@ from theme.tokens import TOKENS
 
 log = logging.getLogger(__name__)
 
-# Preview fits inside this box (logical px) without upscaling.
+# Ceiling for the preview (logical px). The real limit is the screen — see
+# _apply_preview() — because a screenshot from a 4K monitor must not open a
+# window taller than the laptop looking at it.
 _MAX_W, _MAX_H = 1100, 700
+# Horizontal slack, and a first guess at the height of everything that is not the
+# image (hint, nav row, note row, action bar, margins, title bar). Measured at
+# 144px plus a title bar and a second hint line; an underestimate is corrected
+# from the real layout in _load(), so guessing low only costs one extra re-fit.
+_SIDE_SLACK = 96
+_CHROME_H_GUESS = 200
+# Never shrink the preview below this, even on a tiny screen.
+_MIN_PREVIEW = 200
 # Drags smaller than this are treated as a stray click, not a region.
 _MIN_DRAG_PX = 5
 # Crop handle: drawn side length, and the larger radius that counts as a hit.
@@ -286,6 +296,7 @@ class RedactionDialog(QDialog):
         self._ratio = 1.0
         self._offset = QPoint(0, 0)
         self._base_size = QSize(1, 1)
+        self._chrome_h = _CHROME_H_GUESS
 
         self._build_ui()
 
@@ -297,8 +308,8 @@ class RedactionDialog(QDialog):
 
     def _build_ui(self) -> None:
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(12)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(8)
 
         self._hint = QLabel("")
         self._hint.setProperty("role", "caption")
@@ -318,7 +329,7 @@ class RedactionDialog(QDialog):
 
     def _build_nav_bar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
-        bar.setContentsMargins(0, 8, 0, 0)
+        bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(8)
 
         self._prev_btn = QPushButton("← Previous")
@@ -340,7 +351,7 @@ class RedactionDialog(QDialog):
 
     def _build_note_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        row.setContentsMargins(0, 8, 0, 0)
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
         label = QLabel("Note:")
@@ -360,7 +371,7 @@ class RedactionDialog(QDialog):
     def _build_action_bar(self) -> QHBoxLayout:
         """Action bar; the redact-mode and crop-mode button sets share this row."""
         bar = QHBoxLayout()
-        bar.setContentsMargins(0, 16, 0, 0)
+        bar.setContentsMargins(0, 8, 0, 0)
         bar.setSpacing(8)
 
         self._clear_btn = QPushButton("Clear all boxes")
@@ -375,7 +386,7 @@ class RedactionDialog(QDialog):
 
         bar.addStretch(1)
 
-        self._crop_btn = QPushButton("Crop…")
+        self._crop_btn = QPushButton("Crop")
         self._crop_btn.clicked.connect(self._toggle_crop_mode)
         bar.addWidget(self._crop_btn)
 
@@ -442,7 +453,46 @@ class RedactionDialog(QDialog):
 
         self._base_size = base.size()
         self._dpr = max(self.devicePixelRatioF(), 1.0)
-        shown = scaled_to_fit(base, _MAX_W, _MAX_H, self._dpr)
+        self._apply_preview(base)
+
+        self._sync_note_field()
+        self._sync_ui()
+        if not self._note_edit.hasFocus():
+            self._canvas.setFocus()
+        self.adjustSize()
+
+        # _chrome_h starts as an estimate because the real height of everything
+        # around the image is only knowable from a laid-out window. Measure it,
+        # then re-fit while the dialog still overflows the screen — bounded,
+        # because a narrower re-fit can wrap the hint and grow the chrome again.
+        avail_h = self._available().height()
+        for _ in range(3):
+            measured = self.height() - self._canvas.height()
+            if measured > 0:
+                self._chrome_h = measured
+            if self.height() <= avail_h:
+                break
+            self._apply_preview(base)
+            self.adjustSize()
+        self._keep_on_screen()
+        return True
+
+    def _available(self) -> QRect:
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return QRect(0, 0, _MAX_W + _SIDE_SLACK, _MAX_H + _CHROME_H_GUESS)
+        return screen.availableGeometry()
+
+    def _apply_preview(self, base: QPixmap) -> None:
+        """Fit the image to the screen and rebuild every coordinate that depends
+        on the result. Never upscales: QPixmap.scaled() will happily blow a
+        400px screenshot up to fill the box, which looks worse and, for a small
+        image on a small screen, is what pushed the buttons off the bottom."""
+        avail = self._available()
+        box_w = min(_MAX_W, max(_MIN_PREVIEW, avail.width() - _SIDE_SLACK), base.width())
+        box_h = min(_MAX_H, max(_MIN_PREVIEW, avail.height() - self._chrome_h), base.height())
+
+        shown = scaled_to_fit(base, box_w, box_h, self._dpr)
         self._logical_size = QSize(
             max(round(shown.width() / self._dpr), 1),
             max(round(shown.height() / self._dpr), 1),
@@ -455,17 +505,18 @@ class RedactionDialog(QDialog):
 
         self._canvas.set_mode(MODE_CROP if self._crop_mode else MODE_REDACT)
         self._canvas.set_image(shown, self._logical_size)
-        if self._crop_mode:
-            self._canvas.set_crop_rect(self._initial_crop_rect())
-        else:
-            self._canvas.set_crop_rect(None)
+        self._canvas.set_crop_rect(self._initial_crop_rect() if self._crop_mode else None)
 
-        self._sync_note_field()
-        self._sync_ui()
-        if not self._note_edit.hasFocus():
-            self._canvas.setFocus()
-        self.adjustSize()
-        return True
+    def _keep_on_screen(self) -> None:
+        if not self.isVisible():
+            return
+        avail = self._available()
+        geo = self.frameGeometry()
+        if avail.contains(geo):
+            return
+        geo.moveLeft(max(avail.left(), min(geo.left(), avail.right() - geo.width())))
+        geo.moveTop(max(avail.top(), min(geo.top(), avail.bottom() - geo.height())))
+        self.move(geo.topLeft())
 
     def _compute_offset(self, base: QPixmap) -> QPoint:
         """Where display-space (0,0) sits in the ORIGINAL image's coordinates.
@@ -522,7 +573,7 @@ class RedactionDialog(QDialog):
 
         self._prev_btn.setEnabled(not self._crop_mode and self._index > 0)
         self._next_btn.setEnabled(not self._crop_mode and self._index < total - 1)
-        self._crop_btn.setText("Cancel crop" if self._crop_mode else "Crop…")
+        self._crop_btn.setText("Cancel crop" if self._crop_mode else "Crop")
 
         has_crop = bool(event_crop(self._event))
         self._clear_btn.setVisible(not self._crop_mode)

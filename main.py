@@ -155,8 +155,14 @@ def main() -> None:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(default_config(), f, indent=2)
 
-    with open(config_path, encoding="utf-8") as f:
-        raw = json.load(f)
+    # Tolerate a malformed file: it must still reach the error dialog below,
+    # unstyled if need be, rather than dying here with only a log line.
+    raw = {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        logging.getLogger(__name__).exception("could not read config.json for theming")
 
     # Theming is pinned here: the theme is a config value, so it cannot happen before
     # `raw` exists, and it cannot happen after load_config(), whose failure path shows

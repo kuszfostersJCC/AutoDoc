@@ -16,8 +16,9 @@ class MouseHooks:
         self._listener: mouse.Listener | None = None
 
     def _on_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
-        # Release, not press: the target window has reacted before we screenshot.
-        if pressed:
+        # Press, not release: a screenshot documents what was clicked, so it has
+        # to be taken before the target window reacts.
+        if not pressed:
             return
         if button == mouse.Button.left:
             self._on_left(x, y)

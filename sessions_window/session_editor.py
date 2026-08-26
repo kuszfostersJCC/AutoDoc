@@ -298,8 +298,10 @@ class SessionEditorWindow(QMainWindow):
         for eid in self._deleted_ids:
             self._cards[eid].set_marked(True)
 
+        # Recomputed, not just re-applied: deleting the last non-legacy screenshot
+        # flips it, and it gates both the selector and whether _save() stores a mode.
+        self._all_legacy = self._compute_all_legacy()
         self._hint.setText(self._compute_hint())
-        # _all_legacy can flip when photos are imported, so re-apply it on rebuild.
         self._mode_combo.setEnabled(not self._all_legacy)
         self._update_remaining_status()
 

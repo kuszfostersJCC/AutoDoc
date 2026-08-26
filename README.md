@@ -11,8 +11,9 @@ FERPA-protected records, so nothing can go to a cloud API. Internal tool, in use
 by a handful of staff, not packaged for anyone else.
 
 This file is the map and the setup guide. `HANDOFF.md` is invariants and
-gotchas — read it before changing code. `pyside6-ui-style-guide.md` is a binding
-contract for UI work; its §11 checklist defines "done".
+gotchas — read it before changing code. `CLAUDE.md` is the working agreement
+(comment standard, how to verify changes). `pyside6-ui-style-guide.md` is a
+binding contract for UI work; its §11 checklist defines "done".
 
 ## What it does
 
@@ -122,6 +123,7 @@ wrong.
 | `theme/` | Palettes, `app.qss`, icons. All styling goes through here. |
 | `scripts/make_release.py` | Packages `dist/AutoDoc/` into a release zip |
 | `autodoc.spec` | PyInstaller spec; its comments say why each exclude exists |
+| `CLAUDE.md` | Working agreement: comment standard, verification, sandbox rules |
 | `updater.py` | Releases check, download, file-swap |
 
 Original scope: `AutoDoc-Design-PRD.md`, `PRD-v1.1-features.md`,
@@ -142,20 +144,8 @@ Original scope: `AutoDoc-Design-PRD.md`, `PRD-v1.1-features.md`,
 - **AutoDoc can be misconfigured in ways that produce perfect documentation and
   wrong usage metrics,** with no error message. Read `HANDOFF.md` on the AI
   server before touching `generation/backends/`.
-
-### Comments
-
-Comments are 1–3 sentences that clarify genuinely unclear design. Not essays.
-
-- No duplicating the code, no dated changelog entries, no
-  alternatives-considered narrative, no arguing with a future maintainer.
-- Module docstring: one line. Function docstring: only where the signature
-  doesn't already say it.
-- Inline comments earn their place by explaining unidiomatic code, marking a bug
-  fix that looks wrong without them, or flagging incomplete work.
-- If a comment needs to be long, the code is probably unclear — fix the code.
-- The same applies to UI helptext: prefer a self-explanatory label over a caption
-  explaining it.
+- **Comments are 1–3 sentences, not essays**, and the same goes for UI help
+  text. `CLAUDE.md` has the standard and the reasoning; it is short.
 
 ## Building and releasing
 

@@ -229,20 +229,22 @@ def render_event_to_cache(session_dir: Path, event: dict, mode: str, config) -> 
 
     regions = event["data"].get("redact_regions") or []
     crop = event_crop(event)
-    nothing_to_apply = (
-        (mode == "raw" or event_is_legacy(event)) and not regions and not crop
-    )
-    if nothing_to_apply:
+    effect_applies = not (mode == "raw" or event_is_legacy(event))
+    if not effect_applies and not regions and not crop:
         return src
 
-    name = Path(event["data"]["filename"]).name
-    if regions or crop:
-        # Hash covers the crop too: editing either changes the render without
-        # touching the source file's mtime.
-        key = hashlib.md5(
-            json.dumps({"r": regions, "c": crop}, sort_keys=True).encode()
-        ).hexdigest()[:8]
-        name = f"{Path(name).stem}_r{key}.png"
+    # The key must cover everything that changes the output — regions, crop, and
+    # the mode's own radii. Omit any and a Settings change is invisible here,
+    # because the source PNG's mtime never moves.
+    key_src = {"r": regions, "c": crop}
+    if effect_applies:
+        key_src["p"] = [
+            getattr(config, "focus_radius_px", 200),
+            getattr(config, "blur_strength", 15),
+            getattr(config, "circle_radius_px", 36),
+        ]
+    key = hashlib.md5(json.dumps(key_src, sort_keys=True).encode()).hexdigest()[:8]
+    name = f"{Path(event['data']['filename']).stem}_r{key}.png"
     dest = session_dir / "rendered" / mode / name
     if dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime:
         return dest

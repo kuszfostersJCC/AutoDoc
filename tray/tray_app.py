@@ -378,6 +378,10 @@ class TrayApp:
 
     def _transcribe_and_finalize(self, session: Session) -> None:
         stopped_at = datetime.now(timezone.utc)
+        if session is None:
+            log.error("_transcribe_and_finalize: no session to finalize")
+            self._apply_state("IDLE")
+            return
         session.stop()
 
         t0 = time.monotonic()
@@ -393,6 +397,7 @@ class TrayApp:
             self._dump_all_thread_stacks()
             # Finalize anyway; returning early left the session stuck at "recording".
             session.finalize(stopped_at, transcript_ok=False)
+            self._release(session)
             self._notify(
                 "Session saved WITHOUT a transcript (speech model wasn't ready).\n"
                 "Use 'Retranscribe' in View Sessions to try again."
@@ -420,9 +425,16 @@ class TrayApp:
             )
 
         session.finalize(stopped_at, transcript_ok=transcript_ok)
+        self._release(session)
         self._apply_state("IDLE")
         if transcript_ok:
             self._notify("Session saved! Open 'View sessions' to generate documentation.")
+
+    def _release(self, session: Session) -> None:
+        """Drop the finished session. Not done in _stop_recording, which hands the
+        same object to the worker thread that is still using it."""
+        if self._session is session:
+            self._session = None
 
     def _notify(self, message: str) -> None:
         """Tray balloon notification. Safe to call from any thread."""

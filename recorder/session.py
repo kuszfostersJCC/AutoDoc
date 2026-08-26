@@ -3,6 +3,7 @@ the session.json event log (rewritten atomically after every screenshot).
 """
 
 import json
+import logging
 import shutil
 import threading
 import time
@@ -16,6 +17,8 @@ from recorder.audio_capture import AudioCapture
 from recorder.mouse_hooks import MouseHooks
 from recorder.screenshot import capture_raw, save_screenshot_raw
 from recorder.ui_inspect import get_click_target
+
+log = logging.getLogger(__name__)
 
 
 class Session:
@@ -271,36 +274,53 @@ class Session:
     # ---- Click to screenshot pipeline ----
 
     def _handle_click(self, x: int, y: int, click_type: str) -> None:
+        """Grab the screen NOW, on the caller's thread; save and inspect later.
+
+        The grab is the one step that cannot be deferred — the click fires on
+        button-down and the target window starts repainting immediately, so a
+        grab handed to a worker thread races the very change it is meant to
+        precede. That race is what produced blank mid-load pages. Downscaling,
+        writing the PNG and the UI Automation lookup all tolerate the delay.
+        """
         if not self._running or self._paused:
             return
+        if self._screenshot_count >= self.config.max_screenshots_per_session:
+            return
 
+        offset_ms = self._now_offset_ms()
+        try:
+            img, img_x, img_y = capture_raw(x, y)
+        except Exception:
+            log.exception("screenshot: capture failed at (%d, %d)", x, y)
+            return
+
+        # Numbered only after a successful grab, so a failed capture doesn't
+        # consume an event id or a slot against max_screenshots_per_session.
         with self._lock:
             if self._screenshot_count >= self.config.max_screenshots_per_session:
                 return
             self._screenshot_count += 1
             count = self._screenshot_count
 
-        offset_ms = self._now_offset_ms()
         filename = f"screenshots/{count:04d}_{offset_ms}.png"
-        dest_path = self._session_dir / filename
-
         threading.Thread(
-            target=self._capture_and_save,
-            args=(x, y, click_type, offset_ms, count, filename, dest_path),
+            target=self._save_capture,
+            args=(img, img_x, img_y, x, y, click_type, offset_ms, count, filename),
             daemon=True,
         ).start()
 
-    def _capture_and_save(
+    def _save_capture(
         self,
+        img,
+        img_x: int,
+        img_y: int,
         x: int,
         y: int,
         click_type: str,
         offset_ms: int,
         count: int,
         filename: str,
-        dest_path: Path,
     ) -> None:
-        # Inspect first: the UI reacts to the click within milliseconds.
         ui_element = None
         try:
             ui_element = get_click_target(x, y)
@@ -309,11 +329,12 @@ class Session:
 
         try:
             # Stored raw; blur/circle effects are applied at render time.
-            img, img_x, img_y = capture_raw(x, y)
             click_img_x, click_img_y = save_screenshot_raw(
-                img, img_x, img_y, dest_path, self.config.max_image_dimension
+                img, img_x, img_y, self._session_dir / filename,
+                self.config.max_image_dimension,
             )
         except Exception:
+            log.exception("screenshot: could not write %s", filename)
             return
 
         event = {
