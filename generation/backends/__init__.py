@@ -19,4 +19,5 @@ def get_backend(config: AutoDocConfig) -> GenerationBackend:
         endpoint=config.local_endpoint,
         model=config.local_model,
         api_key=config.local_api_key,
+        timeout_s=config.local_timeout_s,
     )

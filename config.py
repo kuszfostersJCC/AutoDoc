@@ -51,6 +51,9 @@ class AutoDocConfig:
     # A metering label, not access control: a blank value still generates fine but
     # folds AutoDoc's usage into aggregate staff chat, with no visible symptom.
     local_api_key: str = "sk-nuPkxLzZ3YFETKOCwhvCXRPjdWB4Ip_J"
+    # A socket inactivity limit, not a total-time cap: the request is non-streaming,
+    # so the server is silent until the whole document is done.
+    local_timeout_s: int = 1800
     # The bot token is deliberately NOT a config key (write_config() rewrites the
     # whole file, so a Settings save would wipe it); see publish/token.py.
     bookstack_enabled: bool = False

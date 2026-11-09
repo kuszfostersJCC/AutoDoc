@@ -20,6 +20,7 @@
 
   "_api_key_comment": "A metering label, not a secret: a blank value silently attributes AutoDoc's usage to 'chat-ui'.",
   "local_api_key": "sk-nuPkxLzZ3YFETKOCwhvCXRPjdWB4Ip_J",
+  "local_timeout_s": 1800,
 
   "_screenshot_comment": "A render setting, not a capture setting: 'raw' | 'blurred' | 'circled', changeable per session afterwards.",
   "screenshot_mode": "circled",
