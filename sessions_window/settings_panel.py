@@ -1,52 +1,7 @@
-"""
-sessions_window/settings_panel.py — the Settings tab inside the Sessions window.
+"""The Settings tab inside the Sessions window.
 
-An interactive editor for the config.json values that plausibly change
-semi-regularly: recording hotkeys, the default screenshot display mode,
-documentation output formats, the AI server, and the Whisper model.
-Deliberately NOT exposed here: `local_api_key`, directory paths and capture
-limits (IT-install decisions, not user settings).
-
-`local_api_key` is a special case worth stating plainly. It is not withheld
-because it is secret — it is the AI server's METERING label, and the server
-accepts requests without it, silently attributing them to `chat-ui`. It is
-withheld because no user has a reason to change it and a typo has no visible
-consequence: documentation still generates, and only the server's year-long
-per-app token record is wrong. So this panel REPORTS attribution status instead
-(the same treatment as the BookStack token, for the same reason — the failure
-mode is invisible) and leaves editing to config.json.
-
-PERSISTENCE MODEL: this panel mutates the SAME AutoDocConfig instance the whole
-app holds (TrayApp, Session, generation all share it), then persists via
-config.write_config(). Consequences, stated per field in the UI:
-  - screenshot mode / output formats / backend: take effect immediately,
-  - hotkeys: read when a recording starts → apply to the NEXT recording,
-  - whisper model: loaded once at startup → requires an app restart.
-
-Theme is the ONE field that repaints the app the moment you change it, before
-any Save. It still needs Save to survive a restart, and the caption says so.
-Applying it on Save instead would mean choosing a theme from a dropdown and
-seeing nothing happen, which reads as a broken control; persisting it on change
-instead would mean write_config() firing at a moment the user didn't ask for a
-save — and because write_config() rewrites the file in FULL from the in-memory
-config (invariant #9), that write would also silently commit whatever other
-fields happened to be in memory. Live-apply + explicit Save is the only
-combination that keeps both properties.
-
-Save writes the FULL config back to config.json. If someone hand-edits the
-deployed config.json while AutoDoc is open and then presses Save here, the
-hand-edit is silently overwritten by whatever the app held in memory. That's a
-documented invariant (HANDOFF.md), not a bug to "fix" by merging on save —
-merging would make the in-memory config and the file disagree in a way nothing
-else in the app expects.
-
-LAYOUT: every label/control pair goes through QFormLayout so the alignment is
-structural rather than a per-row decision — hand-assembling a label and field
-in a QHBoxLayout is how the old UI ended up with a combo box wedged against
-the word "Display:". Help text sits under its field as a caption row.
-
-STYLING: governed by pyside6-ui-style-guide.md + theme/app.qss. No
-setStyleSheet, no colors, no fonts in this file.
+Mutates the AutoDocConfig instance the whole app shares, then persists with
+write_config(), which rewrites config.json in full from memory.
 """
 
 import logging
@@ -85,9 +40,6 @@ log = logging.getLogger(__name__)
 _FORMAT_ORDER = ("docx", "html", "md")
 _FORMAT_LABELS = {"docx": "Word (.docx)", "html": "Web page (.html)", "md": "Markdown (.md)"}
 _WHISPER_MODELS = ("tiny", "base", "small")
-# §3 requires sentence case in the UI; the config values are lowercase
-# internals. Keyed off THEMES so adding a palette can't leave a theme
-# unreachable from the dropdown with no error.
 _THEME_LABELS = {"light": "Light", "dark": "Dark"}
 _THEME_BY_LABEL = {label: name for name, label in _THEME_LABELS.items()}
 
@@ -109,14 +61,11 @@ class SettingsPanel(QWidget):
         self._build()
         self._connect_dirty_tracking()
 
-    # ------------------------------------------------------------------ #
-    # UI                                                                   #
-    # ------------------------------------------------------------------ #
+    # ---- UI ---- #
 
     def _build(self) -> None:
-        # QScrollArea with setWidgetResizable(True) is what removes the height
-        # floor (§6) — without it this tab imposes a minimum height on the
-        # whole window and the Sessions window can't shrink to 760×480.
+        # setWidgetResizable(True) removes this tab's height floor, so the
+        # window can still shrink.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -130,23 +79,18 @@ class SettingsPanel(QWidget):
 
         root = QVBoxLayout(page)
         root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(24)          # gap between sections
+        root.setSpacing(24)
 
-        # Appearance goes FIRST deliberately. The other sections run in rough
-        # workflow order (record → screenshots → output → publish → backend →
-        # updates); appearance belongs to none of that, so it bookends rather
-        # than interleaves, and the top is where someone hunting for dark mode
-        # looks first.
         root.addWidget(self._build_appearance_section())
         root.addWidget(self._build_hotkeys_section())
+        root.addWidget(self._build_audio_section())
         root.addWidget(self._build_screenshots_section())
         root.addWidget(self._build_output_section())
         root.addWidget(self._build_bookstack_section())
         root.addWidget(self._build_backend_section())
         root.addWidget(self._build_updates_section())
         root.addLayout(self._build_save_bar())
-        # The one stretching child is the trailing space, so sections stay
-        # top-aligned instead of spreading down a tall window.
+        # Trailing stretch keeps the sections top-aligned in a tall window.
         root.addStretch(1)
 
     def _section(self, title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -164,18 +108,10 @@ class SettingsPanel(QWidget):
 
     @staticmethod
     def _form(grow: bool = True) -> QFormLayout:
-        """
-        A label/control form. `grow` controls the field column's width policy:
+        """A label/control form.
 
-        - grow=True (default) — fields expand to fill the panel. Required for
-          rows built by _field_with_help(), because the caption beside the
-          control needs leftover space to wrap into; with the fields pinned to
-          sizeHint the row collapses to the control's width and the help text
-          is squeezed to nothing. The control itself is added at stretch 0
-          inside that row, so only the caption takes the extra space.
-        - grow=False — fields stay at their sizeHint. For rows holding a bare
-          control with no help beside it, where expanding would stretch a
-          combo box across the whole panel for no reason.
+        grow=True is required by _field_with_help() rows, whose caption needs
+        leftover space to wrap into; grow=False keeps a bare control at sizeHint.
         """
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -197,19 +133,10 @@ class SettingsPanel(QWidget):
         return label
 
     def _field_with_help(self, control: QWidget, help_text: str) -> QWidget:
-        """
-        Put a field's help text to the RIGHT of the control, not underneath.
+        """Put a field's help text to the right of the control.
 
-        Captions on their own form row stack two rows per setting, which left a
-        column of whitespace beside every short control. Sitting them beside
-        the field uses that space instead.
-
-        The caption must never widen the form: wordWrap(True) plus
-        QSizePolicy(Ignored, Minimum) means it wraps into whatever room is left
-        rather than reporting a long sizeHint and pushing the window wider (§6).
-        Ignored rather than Preferred on the horizontal axis specifically
-        because a Preferred caption still contributes its wrapped width, which
-        is enough to stop the Sessions window shrinking to 760px.
+        The caption's horizontal policy is Ignored so it wraps into the room
+        left over instead of contributing a width that widens the window.
         """
         row = QWidget()
         lay = QHBoxLayout(row)
@@ -229,39 +156,25 @@ class SettingsPanel(QWidget):
 
         self._theme_combo = QComboBox()
         self._theme_combo.addItems([_THEME_LABELS[name] for name in THEMES])
-        # resolve_theme() rather than the raw config value: an out-of-vocabulary
-        # theme in config.json is already being ignored at startup, and the
-        # dropdown must agree with what's actually on screen rather than echo a
-        # value nothing honoured.
+        # resolve_theme() so the dropdown agrees with what is on screen, not
+        # with an out-of-vocabulary config value nothing honoured.
         active = resolve_theme(getattr(self.config_obj, "theme", DEFAULT_THEME))
         self._theme_combo.setCurrentText(_THEME_LABELS[active])
         self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
 
-        # grow=False: the caption below spans the panel (same reasoning as the
-        # Screenshots section), so the combo must not stretch across the field
-        # column.
+        # grow=False: the caption below spans the panel, so the combo must not
+        # stretch across the field column.
         form = self._form(grow=False)
         form.addRow("Theme:", self._theme_combo)
         lay.addLayout(form)
-        lay.addWidget(self._caption(
-            "Changes the app's own windows immediately — click Save settings to "
-            "keep it for next launch. Your screenshots are never altered by this; "
-            "they're shown exactly as captured in both themes."
-        ))
+        lay.addWidget(self._caption("Applies now; Save to keep it."))
         return frame
 
     def _on_theme_changed(self, label: str) -> None:
-        """
-        Repaint the whole app in the chosen theme.
+        """Repaint the whole app in the chosen theme.
 
-        DEFERRED through ui_service rather than applied inline, and that is not
-        incidental: apply_theme() unpolishes and re-polishes EVERY live widget,
-        this combo box among them, and running that from inside the combo's own
-        currentTextChanged emission restyles a widget Qt is still mid-signal on
-        while its popup may not have finished closing. call_soon() posts via
-        QueuedConnection, so the switch happens once the event loop is back at
-        idle. It's the same seam worker threads use — called here from the main
-        thread purely for the deferral, which is a legitimate use of it.
+        Deferred via ui_service.call_soon() because apply_theme() re-polishes
+        every live widget, this combo included, mid-signal.
         """
         theme = _THEME_BY_LABEL.get(label)
         if theme is None:
@@ -275,10 +188,7 @@ class SettingsPanel(QWidget):
         try:
             apply_theme(app, theme)
         except Exception:
-            # A cosmetic failure must not take out the Settings tab. The dirty
-            # marker has already run by now, so overwriting the status text here
-            # is the correct precedence — a failed switch is more important than
-            # "unsaved changes".
+            # A cosmetic failure must not take out the Settings tab.
             log.exception("theme switch to %r failed", theme)
             self._status.setText(
                 f"Could not switch to the {theme} theme — see autodoc.log."
@@ -293,31 +203,77 @@ class SettingsPanel(QWidget):
         self._manual_edit = QLineEdit(cfg.manual_capture_hotkey)
 
         form = self._form()
+        form.addRow("Stop recording:", self._field_with_help(self._stop_edit, ""))
+        form.addRow("Pause / resume:", self._field_with_help(self._pause_edit, ""))
         form.addRow(
-            "Stop recording:",
-            self._field_with_help(
-                self._stop_edit, "Ends the recording without any tray clicks being captured."
-            ),
-        )
-        form.addRow(
-            "Pause / resume:",
-            self._field_with_help(
-                self._pause_edit, "Suspends clicks and narration until pressed again."
-            ),
-        )
-        form.addRow(
-            "Manual screenshot:",
-            self._field_with_help(
-                self._manual_edit, "Captures the screen without clicking (result pages, open menus)."
-            ),
+            "Screenshot without clicking:",
+            self._field_with_help(self._manual_edit, ""),
         )
         lay.addLayout(form)
 
         lay.addWidget(self._caption(
-            "Format: <ctrl>+<shift>+s — leave blank to disable. "
-            "Changes apply to the next recording."
+            "Blank disables. Applies to the next recording."
         ))
         return frame
+
+    def _build_audio_section(self) -> QFrame:
+        """Which microphone recordings come from.
+
+        Device NAMES are stored, not PortAudio indices (see
+        recorder/audio_capture.py); the list is refreshable on demand.
+        """
+        frame, lay = self._section("Microphone")
+
+        self._audio_combo = QComboBox()
+        self._audio_combo.setObjectName("settingsAudioDevice")
+        self._populate_audio_devices()
+
+        self._audio_refresh_btn = QPushButton("Refresh")
+        self._audio_refresh_btn.clicked.connect(self._refresh_audio_devices)
+
+        device_row = QWidget()
+        device_lay = QHBoxLayout(device_row)
+        device_lay.setContentsMargins(0, 0, 0, 0)
+        device_lay.setSpacing(8)
+        device_lay.addWidget(self._audio_combo, 1)
+        device_lay.addWidget(self._audio_refresh_btn)
+
+        form = self._form()
+        form.addRow(
+            "Input device:",
+            self._field_with_help(device_row, ""),
+        )
+        lay.addLayout(form)
+
+        lay.addWidget(self._caption("Applies to the next recording."))
+        return frame
+
+    def _populate_audio_devices(self) -> None:
+        """Fill the dropdown, keeping the saved device selectable while unattached."""
+        from recorder.audio_capture import list_input_devices
+
+        current = (getattr(self.config_obj, "audio_device", "") or "").strip()
+        # Repopulating fires currentIndexChanged, which would flag the panel
+        # dirty with nothing changed.
+        self._audio_combo.blockSignals(True)
+        self._audio_combo.clear()
+        self._audio_combo.addItem("System default", "")
+
+        names = []
+        for dev in list_input_devices():
+            self._audio_combo.addItem(dev["name"], dev["name"])
+            names.append(dev["name"])
+        if current and current not in names:
+            self._audio_combo.addItem(f"{current} (not connected)", current)
+
+        index = self._audio_combo.findData(current)
+        self._audio_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._audio_combo.blockSignals(False)
+
+    def _refresh_audio_devices(self) -> None:
+        self._populate_audio_devices()
+        count = max(self._audio_combo.count() - 1, 0)
+        self._status.setText(f"Microphone list refreshed — {count} input device(s) found.")
 
     def _build_screenshots_section(self) -> QFrame:
         frame, lay = self._section("Screenshots")
@@ -326,15 +282,13 @@ class SettingsPanel(QWidget):
         self._mode_combo.addItems(list(RENDER_MODES))
         self._mode_combo.setCurrentText(self.config_obj.screenshot_mode)
 
-        # grow=False: this row's help text stays full-width beneath the form
-        # (it's a long sentence that reads better spanning the panel), so the
-        # combo must not stretch to fill the field column.
+        # grow=False: the help text below spans the panel, so the combo must not
+        # stretch across the field column.
         form = self._form(grow=False)
         form.addRow("Default display mode:", self._mode_combo)
         lay.addLayout(form)
         lay.addWidget(self._caption(
-            "raw = untouched • blurred = privacy blur • circled = red circle at click. "
-            "Each session can override this in the editor."
+            "blurred = hide all but the click; circled = mark it."
         ))
         return frame
 
@@ -354,25 +308,14 @@ class SettingsPanel(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
-        lay.addWidget(self._caption(
-            "Formats written when generating documentation. At least one required."
-        ))
+        lay.addWidget(self._caption("At least one required."))
         return frame
 
     def _build_bookstack_section(self) -> QFrame:
-        """
-        BookStack publishing (PRD-v1.3-bookstack.md).
+        """BookStack publishing.
 
-        The bot TOKEN is deliberately absent — it isn't a config key at all (it
-        would be wiped by the full-config rewrite on Save) and there's no masked
-        input anywhere in this app, matching the local_api_key rule in this
-        module's docstring. Instead the panel REPORTS token status, because the failure
-        mode without it is silent: publishing simply never happens, and the only
-        evidence is a line in autodoc.log.
-
-        base_url and timeout stay config.json-only. Nobody changes them, and
-        hiding them would need a collapsible-section pattern the style guide
-        doesn't have — not worth inventing one for two fields.
+        The bot token is not a config key, so it is reported here rather than
+        edited; base_url and timeout stay config.json-only.
         """
         frame, lay = self._section("Publish to BookStack")
         cfg = self.config_obj
@@ -389,8 +332,8 @@ class SettingsPanel(QWidget):
         def _vocab_combo(values: tuple, current: str) -> QComboBox:
             combo = QComboBox()
             combo.addItems(list(values))
-            # An out-of-vocabulary config value would otherwise silently show as
-            # the first entry, i.e. the UI would lie about what is configured.
+            # An out-of-vocabulary config value would otherwise show as the
+            # first entry.
             combo.setCurrentText(current if current in values else values[0])
             return combo
 
@@ -410,28 +353,25 @@ class SettingsPanel(QWidget):
         form = self._form()
         form.addRow(
             "Book:",
-            self._field_with_help(
-                self._bs_book,
-                "Holding book for generated pages. Created if it doesn't exist.",
-            ),
+            self._field_with_help(self._bs_book, "Created if it doesn't exist."),
         )
         form.addRow(
             "Doc type:",
             self._field_with_help(
-                self._bs_doc_type, "Doc-Type tag. Pages are always tagged Status: draft."
+                self._bs_doc_type, "Pages are always tagged Status: draft."
             ),
         )
         form.addRow(
             "Owner:",
-            self._field_with_help(self._bs_owner, "Department responsible for the page."),
+            self._field_with_help(self._bs_owner, ""),
         )
         form.addRow(
             "Audience:",
-            self._field_with_help(self._bs_audience, "Who the documentation is for."),
+            self._field_with_help(self._bs_audience, ""),
         )
         form.addRow(
             "Review cycle:",
-            self._field_with_help(self._bs_review, "How often the page should be rechecked."),
+            self._field_with_help(self._bs_review, ""),
         )
         lay.addLayout(form)
 
@@ -450,14 +390,7 @@ class SettingsPanel(QWidget):
 
     @staticmethod
     def _token_status_text() -> str:
-        """
-        Report whether the bot token is present and parseable.
-
-        Worth surfacing in the UI rather than leaving to the log: a missing token
-        makes publishing a no-op with no user-visible symptom at all, and "I
-        ticked the box and nothing happened" is otherwise unfalsifiable from the
-        Settings tab.
-        """
+        """Publishing is a silent no-op without a token, so its status is surfaced."""
         from publish.token import load_token, token_path
 
         if load_token() is not None:
@@ -472,29 +405,15 @@ class SettingsPanel(QWidget):
             widget.setEnabled(on)
 
     def _build_backend_section(self) -> QFrame:
-        """
-        The AI server.
-
-        There is no Provider dropdown any more (removed 2026-08-06 with the
-        Anthropic backend — see generation/backends/__init__.py). What replaced
-        it is a metering-status caption, which is a strictly better use of the
-        row: "which of two providers" was a question nobody asked, whereas "are
-        my requests being counted under the right application" is a question
-        with an invisible wrong answer.
-        """
         frame, lay = self._section("AI server")
         cfg = self.config_obj
 
         self._endpoint_edit = QLineEdit(cfg.local_endpoint)
-        # Widths for these two live in app.qss (#settingsEndpoint /
-        # #settingsModel) — both hold long values that truncate at the default
-        # sizeHint.
+        # Widths for these two live in app.qss (#settingsEndpoint / #settingsModel).
         self._endpoint_edit.setObjectName("settingsEndpoint")
 
-        # Editable combo: type a model id, or Fetch to list what the server
-        # actually serves (/v1/models). Ids must match EXACTLY — llama.cpp
-        # derives them from GGUF filenames, Ollama uses registry tags — which
-        # is why this one is editable and the others are not.
+        # Editable because a model id must match the server exactly: llama.cpp
+        # derives ids from GGUF filenames, Ollama uses registry tags.
         self._model_combo = QComboBox()
         self._model_combo.setObjectName("settingsModel")
         self._model_combo.setEditable(True)
@@ -517,59 +436,44 @@ class SettingsPanel(QWidget):
         form = self._form()
         form.addRow(
             "Endpoint:",
-            self._field_with_help(
-                self._endpoint_edit,
-                "The district AI server's chat endpoint. Must be port 8080 — "
-                "that is the metering proxy.",
-            ),
+            self._field_with_help(self._endpoint_edit, "The AI chat endpoint."),
         )
         form.addRow(
             "Model:",
             self._field_with_help(
                 model_row,
-                "Must match a model id on the server. Fetch queries /v1/models. "
-                "Only one model is resident at a time, so switching away from "
-                "the shared default makes every generation wait for a model swap.",
+                "Click fetch to see available server models. Requires compatible endpoint.",
             ),
         )
         form.addRow(
             "Speech model:",
             self._field_with_help(
-                self._whisper_combo,
-                "Whisper size — bigger is more accurate but slower. "
-                "Takes effect after restarting AutoDoc.",
+                self._whisper_combo, "Bigger is slower. Restart to apply."
             ),
         )
         lay.addLayout(form)
 
-        self._metering_status = self._caption(self._metering_status_text())
-        lay.addWidget(self._metering_status)
+        # Stays invisible unless the endpoint is actually misconfigured.
+        self._endpoint_warning = QLabel("")
+        self._endpoint_warning.setProperty("role", "danger")
+        self._endpoint_warning.setWordWrap(True)
+        lay.addWidget(self._endpoint_warning)
+        self._sync_endpoint_warning()
         return frame
 
-    def _metering_status_text(self) -> str:
-        """
-        Report how this machine's requests will be counted on the AI server.
+    def _sync_endpoint_warning(self) -> None:
+        """Show endpoint_warnings() — currently that port 8081 answers but bypasses
+        metering, so the endpoint must be 8080 — or nothing. The backend import is
+        guarded so a warning can never stop the tab building."""
+        try:
+            from generation.backends.local_vision_backend import endpoint_warnings
 
-        Both failure modes here are silent — a blank key and a port-8081
-        endpoint each generate documentation perfectly while making the usage
-        record wrong — so the Settings tab is the only place they can be seen
-        without reading autodoc.log or the Grafana dashboard.
-        """
-        from generation.backends.local_vision_backend import endpoint_warnings
-
-        cfg = self.config_obj
-        if (getattr(cfg, "local_api_key", "") or "").strip():
-            text = "Usage attributed to: doc-generator (API key present)."
-        else:
-            text = (
-                "Usage attributed to: chat-ui — NO API KEY. Documentation will "
-                "still generate, but this machine's tokens are being counted as "
-                "staff chat. Set local_api_key in config.json."
-            )
-        warnings = endpoint_warnings(self._endpoint_edit.text())
-        if warnings:
-            text += " " + " ".join(warnings)
-        return text
+            text = " ".join(endpoint_warnings(self._endpoint_edit.text()))
+        except Exception:
+            log.exception("settings: endpoint warning check failed")
+            text = ""
+        self._endpoint_warning.setText(text)
+        self._endpoint_warning.setVisible(bool(text))
 
     def _build_updates_section(self) -> QFrame:
         frame, lay = self._section("Updates")
@@ -604,16 +508,9 @@ class SettingsPanel(QWidget):
         bar.addWidget(save_btn)
         return bar
 
-    # ------------------------------------------------------------------ #
-    # Dirty tracking                                                       #
-    # ------------------------------------------------------------------ #
+    # ---- Dirty tracking ---- #
 
     def _connect_dirty_tracking(self) -> None:
-        """
-        Flag unsaved edits — "did I forget to save?" should never be a mystery
-        (field report 2026-07-14: a user unchecked a format, still got the file,
-        and couldn't tell whether Save had happened).
-        """
         for edit in (
             self._stop_edit,
             self._pause_edit,
@@ -623,13 +520,8 @@ class SettingsPanel(QWidget):
         ):
             edit.textEdited.connect(self._mark_dirty)
         for combo in (
-            # _theme_combo is here as well as having its own handler: the theme
-            # applies live but is NOT persisted until Save, so it is genuinely
-            # an unsaved change and must say so. Connected AFTER
-            # _on_theme_changed (which _build wires up), so on a theme change
-            # the dirty message lands last and is what the user sees — unless
-            # the switch itself failed, in which case the deferred handler
-            # overwrites it with the error.
+            # The theme applies live but is not persisted until Save, so it is
+            # still an unsaved change.
             self._theme_combo,
             self._mode_combo,
             self._whisper_combo,
@@ -641,6 +533,8 @@ class SettingsPanel(QWidget):
             combo.currentTextChanged.connect(self._mark_dirty)
         # Editable combo: catch both typing and picking from the list.
         self._model_combo.currentTextChanged.connect(self._mark_dirty)
+        # By index, not text: the stored value is the item's data, not its label.
+        self._audio_combo.currentIndexChanged.connect(self._mark_dirty)
         for box in (*self._format_boxes.values(), self._bs_enabled):
             box.toggled.connect(self._mark_dirty)
 
@@ -648,20 +542,17 @@ class SettingsPanel(QWidget):
         self._dirty = True
         self._status.setText("Unsaved changes — click Save settings to apply.")
 
-    # ------------------------------------------------------------------ #
-    # Model list fetch                                                     #
-    # ------------------------------------------------------------------ #
+    # ---- Model list fetch ---- #
 
     def _fetch_models(self) -> None:
-        """Query the local endpoint's /v1/models on a worker thread and fill the
-        dropdown. Also warns about text-only models — a model without vision
-        support silently ignores every screenshot."""
+        """Query /v1/models on a worker thread and fill the dropdown; warns about
+        text-only models, which silently ignore every screenshot."""
         endpoint = self._endpoint_edit.text().strip()
         if not endpoint:
             self._status.setText("Enter the endpoint first, then Fetch.")
             return
-        # Read on the UI thread, passed into the worker — never reach into
-        # self.config_obj from the thread.
+        # Read on the UI thread and passed in; the worker never touches
+        # self.config_obj.
         api_key = getattr(self.config_obj, "local_api_key", "")
         self._fetch_btn.setEnabled(False)
         self._fetch_btn.setText("…")
@@ -705,9 +596,7 @@ class SettingsPanel(QWidget):
         self._reset_fetch_button()
         self._status.setText(f"Model lookup failed — {error}")
 
-    # ------------------------------------------------------------------ #
-    # Save                                                                 #
-    # ------------------------------------------------------------------ #
+    # ---- Save ---- #
 
     def _validate_hotkeys(self) -> list[str]:
         """Return error strings for invalid/duplicate hotkey combos."""
@@ -760,13 +649,12 @@ class SettingsPanel(QWidget):
             return
 
         cfg = self.config_obj
-        # Already applied live by _on_theme_changed; this is only the persist
-        # half. Falls back to the current value rather than a literal default so
-        # a label that somehow isn't in the map can't silently reset the theme.
+        # Already applied live by _on_theme_changed; this is only the persist half.
         cfg.theme = _THEME_BY_LABEL.get(self._theme_combo.currentText(), cfg.theme)
         cfg.stop_hotkey = self._stop_edit.text().strip()
         cfg.pause_hotkey = self._pause_edit.text().strip()
         cfg.manual_capture_hotkey = self._manual_edit.text().strip()
+        cfg.audio_device = self._audio_combo.currentData() or ""
         cfg.screenshot_mode = self._mode_combo.currentText()
         cfg.output_formats = formats
         cfg.local_endpoint = endpoint
@@ -791,13 +679,11 @@ class SettingsPanel(QWidget):
         if restart_needed:
             msg += " Restart AutoDoc to load the new speech model."
 
-        # The endpoint may have just changed, and a port-8081 endpoint is a
-        # metering hole with no other symptom — recompute rather than leaving
-        # the caption describing the previous value.
-        self._metering_status.setText(self._metering_status_text())
+        # The endpoint may have just changed; recompute rather than leave the
+        # warning describing the previous value.
+        self._sync_endpoint_warning()
 
-        # Re-check on save rather than only at panel build: the token may have
-        # been dropped in while this window was open.
+        # The token may have been dropped in while this window was open.
         from publish.token import load_token
 
         self._bs_token_status.setText(self._token_status_text())
@@ -810,9 +696,7 @@ class SettingsPanel(QWidget):
         self._status.setText(msg)
         log.info("settings saved via Settings tab")
 
-    # ------------------------------------------------------------------ #
-    # Updates — manual only, via GitHub Releases (see updater.py)          #
-    # ------------------------------------------------------------------ #
+    # ---- Updates — manual only, via GitHub Releases (see updater.py) ---- #
 
     def _check_for_updates(self) -> None:
         self._update_btn.setEnabled(False)
@@ -851,11 +735,7 @@ class SettingsPanel(QWidget):
         self._update_status.setText(error)
 
     def _show_update_dialog(self, info) -> None:
-        """
-        Release-notes dialog with Update now / Not now — this is the whole "let
-        people decide if they need the new features" requirement: the release
-        body IS the changelog shown here, nothing separate to write.
-        """
+        """Release-notes dialog; the GitHub release body is the changelog shown."""
         dialog = QDialog(self.window())
         dialog.setWindowTitle("AutoDoc — Update available")
         dialog.setMinimumSize(480, 360)
@@ -876,7 +756,7 @@ class SettingsPanel(QWidget):
         notes = QPlainTextEdit()
         notes.setPlainText(info.notes)
         notes.setReadOnly(True)
-        lay.addWidget(notes, 1)      # the one stretching child
+        lay.addWidget(notes, 1)
 
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 16, 0, 0)
@@ -923,12 +803,8 @@ class SettingsPanel(QWidget):
         threading.Thread(target=_work, name="update-download", daemon=True).start()
 
     def _on_downloaded(self, zip_path) -> None:
-        """
-        Spawn the detached updater script, then quit AutoDoc immediately — see
-        updater.py's module docstring for why the file swap can't happen
-        in-process. Nothing after quit_for_update() runs; the relaunch happens
-        from the script, not from this process.
-        """
+        """Spawn the detached updater script, then quit immediately; the file swap
+        cannot happen in-process (see updater.py). The script does the relaunch."""
         import updater
 
         self._update_status.setText("Restarting to apply the update…")

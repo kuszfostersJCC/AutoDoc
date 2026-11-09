@@ -1,43 +1,7 @@
-"""
-generation/renderers.py — Turn generated markdown into deliverable files:
-Markdown (with image links), self-contained HTML, and Word (.docx), each with
-the session's screenshots embedded at the steps they illustrate (PRD F2).
+"""Renders a prepared document to .md, self-contained .html and .docx.
 
-Screenshot placement contract:
-The generator's system prompt instructs the model to place screenshots using
-tokens of the form `{{screenshot:evt_0004}}` on their own line. This module:
-  - resolves each valid token to that event's RENDERED image (respecting the
-    session's render mode and redaction regions via render_event_to_cache),
-  - keeps only the FIRST occurrence of each id, strips unknown/duplicate tokens,
-  - appends any screenshots the model didn't place under a final
-    "Screen reference" heading, so images are never silently lost — an
-    imperfect model degrades to "all images at the end", not "no images".
-
-The markdown→HTML/docx conversion is deliberately NOT a general markdown
-engine. The prompt mandates a narrow structure (H1/H2/H3 headings, paragraphs,
-"- " bullet lists, **bold**) and that is all this parses. If the prompt's
-output format changes, update _iter_blocks() to match.
-
-PUBLIC API — two steps, deliberately separate:
-
-    prepared = prepare_document(markdown, session_data, session_dir, config)
-    paths    = write_outputs(prepared, session_data, config, output_dir)
-
-prepare_document() does the model-output normalization ONCE and hands back a
-PreparedDocument. Every consumer of generated documentation — the file writers
-here, and any publishing destination (see PRD-v1.3-bookstack.md) — must go
-through it rather than re-parsing the model's raw markdown. Two reasons, both
-learned the hard way:
-
-  1. _hoist_inline_tokens() is what makes weaker models' inline token placement
-     render at all. A consumer that parses raw markdown silently drops images.
-  2. PreparedDocument.images is whatever render_event_to_cache() returns — the
-     session's render mode, click circle, and redaction regions already applied.
-     A consumer that resolves its own image paths from screenshots/ would emit
-     un-redacted originals while the local .docx looked correct. (Note
-     render_event_to_cache legitimately returns the source path itself when
-     there is nothing to apply — raw mode with no redactions — so "always use
-     what it returned" is the rule, not "never touch screenshots/".)
+_iter_blocks() must parse exactly the markdown subset generation/content.py's prompt
+permits; anything wider reaches the reader as raw pipes and asterisks.
 """
 
 import base64
@@ -58,23 +22,13 @@ _TOKEN_RE = re.compile(r"\{\{screenshot:([\w-]+)\}\}")
 VALID_FORMATS = ("md", "html", "docx")
 
 
-# ------------------------------------------------------------------ #
-# Public entry points                                                  #
-# ------------------------------------------------------------------ #
-
 @dataclass
 class PreparedDocument:
-    """
-    Generated documentation, normalized once and ready for any destination.
+    """Generated documentation, normalized once and ready for any destination.
 
-    doc     — markdown whose remaining {{screenshot:id}} tokens are guaranteed
-              valid, unique, and alone on their own line.
-    images  — event_id → render_event_to_cache() path, chronological. Render mode
-              and redaction regions already applied. Use these paths as given;
-              don't re-resolve from screenshots/.
-    stem    — filesystem-safe filename stem (no extension).
-    title   — the document's H1 as written, for destinations that want a human
-              title rather than a filename. Empty if the model omitted an H1.
+    `doc`'s remaining tokens are valid, unique and alone on their line. `images`
+    paths already have render mode and redactions applied — use them as given
+    rather than re-resolving from screenshots/.
     """
 
     doc: str
@@ -89,34 +43,22 @@ def prepare_document(
     session_dir: Path,
     config,
 ) -> PreparedDocument:
-    """
-    Normalize raw model output into a PreparedDocument.
-
-    Call this exactly once per generation and pass the result to every
-    destination — see this module's docstring for why re-parsing the raw
-    markdown downstream is a defect, not a shortcut.
-    """
+    """Normalize raw model output once per generation; every destination uses the result."""
     fallback = session_data.get("session_id", "session")
     images = _resolve_images(session_data, session_dir, config)
     return PreparedDocument(
         doc=_normalize_tokens(markdown, images),
         images=images,
-        # Both derived from the RAW markdown: _normalize_tokens only touches
-        # screenshot tokens, but deriving from it would couple the output
-        # filename to token-hoisting behaviour for no reason.
+        # From the RAW markdown, so the filename can't depend on token hoisting.
         stem=_derive_stem(markdown, fallback),
         title=_derive_title(markdown),
     )
 
 
 def substitute_tokens(doc: str, resolve) -> str:
-    """
-    Replace every {{screenshot:id}} token via resolve(event_id) -> str.
+    """Replace every {{screenshot:id}} token via resolve(event_id) -> str.
 
-    Public so destinations don't each carry their own copy of the token regex —
-    the pattern belongs in exactly one place. Return "" from resolve to strip a
-    token (used for the placeholder body BookStack needs before its images can be
-    uploaded).
+    Returning "" from resolve strips the token.
     """
     return _TOKEN_RE.sub(lambda m: resolve(m.group(1)), doc)
 
@@ -127,18 +69,10 @@ def write_outputs(
     config,
     output_dir: Path,
 ) -> list[Path]:
-    """
-    Write a PreparedDocument in every configured output format.
+    """Write a PreparedDocument into output_dir/<session name>/, one format each.
 
-    Returns the list of written paths (first = primary, shown in the UI).
-    Raises only if NO format could be written; individual format failures
-    are logged and skipped so one bad exporter can't destroy a generation
-    that cost real time and tokens.
-
-    Files land in output_dir/<session name>/ — one subfolder per session, so
-    multi-format output (plus the md's images folder) doesn't pile every
-    session's files into one flat directory. Re-generating the same session
-    reuses its folder; filename collisions get _1/_2 suffixes as before.
+    Returns the written paths (first = primary). Individual format failures are
+    logged and skipped; raises only when every format failed.
     """
     session_label = session_data.get("name") or session_data.get("session_id", "session")
     output_dir = output_dir / _safe_dirname(session_label)
@@ -173,9 +107,7 @@ def write_outputs(
     return written
 
 
-# ------------------------------------------------------------------ #
-# Document preparation                                                 #
-# ------------------------------------------------------------------ #
+# --- Document preparation ---
 
 def _resolve_images(session_data: dict, session_dir: Path, config) -> dict:
     """event_id → rendered image Path, in chronological order (dicts preserve it)."""
@@ -193,12 +125,8 @@ def _resolve_images(session_data: dict, session_dir: Path, config) -> dict:
 
 
 def _normalize_tokens(markdown: str, images: dict) -> str:
-    """
-    Normalize the model's token usage:
-      - keep the first occurrence of each KNOWN id, drop later duplicates,
-      - strip tokens for unknown ids entirely,
-      - append unused screenshots under a "Screen reference" heading.
-    Output is markdown whose remaining tokens are guaranteed valid and unique.
+    """Keep the first occurrence of each known id, strip unknown and duplicate tokens,
+    and append screenshots the model never placed under a "Screen reference" heading.
     """
     seen: set[str] = set()
 
@@ -231,16 +159,10 @@ _EMPTY_PAREN_RE = re.compile(r"\(\s*(?:see|refer to|shown in|as shown)?\s*[,;:]?
 
 
 def _hoist_inline_tokens(doc: str) -> str:
-    """
-    Move tokens embedded mid-sentence onto their own lines.
+    """Move tokens embedded mid-sentence onto their own lines.
 
-    Models — especially weaker local ones — routinely write
-    "…enter the login name. (See {{screenshot:evt_0004}})." despite the
-    prompt requiring tokens alone on a line. The block parser below only
-    treats whole-line tokens as images, so without this pass inline tokens
-    rendered as literal text in HTML/docx (observed in the field 2026-07-13,
-    while the markdown writer's global regex substitution masked the problem
-    in .md output). Hoisting also tidies the leftover "(See )" debris.
+    Models write them inline despite the prompt, and _iter_blocks() only treats a
+    whole-line token as an image.
     """
     out: list[str] = []
     for line in doc.splitlines():
@@ -254,8 +176,8 @@ def _hoist_inline_tokens(doc: str) -> str:
             continue
         text = _TOKEN_RE.sub("", line)
         text = _EMPTY_PAREN_RE.sub("", text)      # "(See )." → gone
-        text = re.sub(r"\s+([.,;:!?])", r"\1", text)  # " ." → "."
-        text = re.sub(r"\.{2,}", ".", text)       # ".." → "."
+        text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+        text = re.sub(r"\.{2,}", ".", text)
         text = re.sub(r"\s{2,}", " ", text).rstrip()
         if text.strip():
             out.append(text)
@@ -267,44 +189,223 @@ def _hoist_inline_tokens(doc: str) -> str:
     return "\n".join(out)
 
 
+# --- Block parsing ---
+
+# The required whitespace after the marker keeps "**Note**" from matching.
+_UL_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*+][ \t]+(?P<text>.*)$")
+_OL_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)\d{1,3}[.)][ \t]+(?P<text>.*)$")
+# Rules and setext underlines, dropped rather than rendered: a literal row of
+# dashes in a Word document is worse than a missing separator.
+_RULE_RE = re.compile(r"^[-*_=]{3,}$")
+
+
+def _indent_width(indent: str) -> int:
+    """Tabs count as 4. Only relative order matters — see _assign_levels."""
+    return len(indent.replace("\t", "    "))
+
+
+def _match_list_item(raw_line: str) -> dict | None:
+    """A list item as {"indent": int, "ordered": bool, "text": str}, or None."""
+    for regex, ordered in ((_UL_ITEM_RE, False), (_OL_ITEM_RE, True)):
+        match = regex.match(raw_line)
+        if match:
+            return {
+                "indent": _indent_width(match.group("indent")),
+                "ordered": ordered,
+                "text": match.group("text").strip(),
+            }
+    return None
+
+
+def _assign_levels(items: list[dict]) -> list[dict]:
+    """Turn raw indent widths into 0-based nesting levels.
+
+    Only relative indent matters, because models mix 2-, 3- and 4-space nesting
+    inside one list.
+    """
+    stack: list[int] = []
+    out: list[dict] = []
+    for item in items:
+        indent = item["indent"]
+        while stack and indent < stack[-1]:
+            stack.pop()
+        if not stack or indent > stack[-1]:
+            stack.append(indent)
+        out.append({
+            "level": len(stack) - 1,
+            "ordered": item["ordered"],
+            "text": item["text"],
+        })
+    return out
+
+
+def _is_table_delimiter(line: str) -> bool:
+    """True for a pipe-table separator row like `|---|:--:|`."""
+    stripped = line.strip()
+    if "|" not in stripped or "-" not in stripped:
+        return False
+    return all(char in "|-: \t" for char in stripped)
+
+
+def _split_row(line: str) -> list[str]:
+    """Split one pipe-table row, tolerating missing outer pipes."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _parse_alignments(delimiter: str, width: int) -> list[str | None]:
+    """Column alignments from the separator row: `:--`, `:-:`, `--:`."""
+    aligns: list[str | None] = []
+    for cell in _split_row(delimiter):
+        left, right = cell.startswith(":"), cell.endswith(":")
+        aligns.append(
+            "center" if left and right else "right" if right else "left" if left else None
+        )
+    return (aligns + [None] * width)[:width]
+
+
+def _try_parse_table(lines: list[str], start: int) -> tuple[dict, int] | None:
+    """Parse a pipe table beginning at `start`, returning (block, lines_consumed) or None.
+
+    The separator row is required, or a sentence containing a pipe becomes a table;
+    rows are padded or truncated to the header width.
+    """
+    if start + 1 >= len(lines):
+        return None
+    header_line = lines[start].strip()
+    if "|" not in header_line or not _is_table_delimiter(lines[start + 1]):
+        return None
+
+    header = _split_row(header_line)
+    aligns = _parse_alignments(lines[start + 1], len(header))
+
+    rows: list[list[str]] = []
+    index = start + 2
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not stripped or "|" not in stripped:
+            break
+        cells = _split_row(stripped)
+        rows.append((cells + [""] * len(header))[: len(header)])
+        index += 1
+
+    return {"header": header, "align": aligns, "rows": rows}, index - start
+
+
+def _next_content_is_list_item(lines: list[str], start: int) -> bool:
+    """Looking past blank lines, is the next real line another list item?"""
+    for line in lines[start:]:
+        if line.strip():
+            return _match_list_item(line) is not None
+    return False
+
+
 def _iter_blocks(doc: str):
+    """Yield (kind, payload) blocks from the model's markdown:
+
+      ("heading", (level, text))
+      ("list",    [{"level": int, "ordered": bool, "text": str}, ...])
+      ("table",   {"header": [str], "align": [str|None], "rows": [[str], ...]})
+      ("image",   event_id)
+      ("para",    text)
+
+    Not a general markdown engine: fenced code, block quotes and HTML are not parsed.
     """
-    Yield (kind, payload) blocks from the constrained markdown:
-      ("heading", (level, text)) | ("bullets", [items]) | ("image", event_id)
-      | ("para", text)
-    """
-    bullets: list[str] = []
-    for raw_line in doc.splitlines():
+    lines = doc.splitlines()
+    index = 0
+    pending: list[dict] = []
+
+    while index < len(lines):
+        raw_line = lines[index]
         line = raw_line.strip()
 
-        is_bullet = line.startswith("- ") or line.startswith("* ")
-        if bullets and not is_bullet:
-            yield ("bullets", bullets)
-            bullets = []
-
         if not line:
+            # A blank line between items is a loose list, not the end of one.
+            if pending and _next_content_is_list_item(lines, index + 1):
+                index += 1
+                continue
+            if pending:
+                yield ("list", _assign_levels(pending))
+                pending = []
+            index += 1
             continue
+
+        table = _try_parse_table(lines, index)
+        if table is not None:
+            if pending:
+                yield ("list", _assign_levels(pending))
+                pending = []
+            block, consumed = table
+            yield ("table", block)
+            index += consumed
+            continue
+
+        item = _match_list_item(raw_line)
+        if item is not None:
+            pending.append(item)
+            index += 1
+            continue
+
+        # Anything else ends an open list.
+        if pending:
+            yield ("list", _assign_levels(pending))
+            pending = []
 
         token = _TOKEN_RE.fullmatch(line)
         if token:
             yield ("image", token.group(1))
+        elif _RULE_RE.fullmatch(line):
+            pass
         elif line.startswith("#"):
             level = len(line) - len(line.lstrip("#"))
             yield ("heading", (min(level, 4), line[level:].strip()))
-        elif is_bullet:
-            bullets.append(line[2:].strip())
         else:
             yield ("para", line)
-    if bullets:
-        yield ("bullets", bullets)
+        index += 1
+
+    if pending:
+        yield ("list", _assign_levels(pending))
 
 
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# --- Inline formatting ---
+
+# Bold BEFORE italic so `**x**` isn't consumed by the single-asterisk branch.
+# Underscore emphasis is unsupported on purpose: it would eat the underscores in
+# field names like some_field_name.
+_INLINE_RE = re.compile(
+    r"\*\*(?P<bold>.+?)\*\*"
+    r"|(?<!\*)\*(?P<italic>[^*\n]+?)\*(?!\*)"
+    r"|`(?P<code>[^`\n]+?)`"
+)
 
 
-# ------------------------------------------------------------------ #
-# Markdown                                                             #
-# ------------------------------------------------------------------ #
+def _iter_inline(text: str):
+    """Yield (chunk, bold, italic, code) spans covering `text` exactly once."""
+    position = 0
+    for match in _INLINE_RE.finditer(text):
+        if match.start() > position:
+            yield (text[position:match.start()], False, False, False)
+        if match.group("bold") is not None:
+            yield (match.group("bold"), True, False, False)
+        elif match.group("italic") is not None:
+            yield (match.group("italic"), False, True, False)
+        else:
+            yield (match.group("code"), False, False, True)
+        position = match.end()
+    if position < len(text):
+        yield (text[position:], False, False, False)
+
+
+def _strip_inline(text: str) -> str:
+    """Text with emphasis markers removed — for headings, which style themselves."""
+    return "".join(chunk for chunk, _b, _i, _c in _iter_inline(text))
+
+
+# --- Markdown ---
 
 def _write_md(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
     path = _unique_path(output_dir / f"{stem}.md")
@@ -327,9 +428,7 @@ def _write_md(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
     return path
 
 
-# ------------------------------------------------------------------ #
-# Self-contained HTML                                                  #
-# ------------------------------------------------------------------ #
+# --- Self-contained HTML ---
 
 _HTML_SHELL = """<!DOCTYPE html>
 <html lang="en">
@@ -345,7 +444,15 @@ _HTML_SHELL = """<!DOCTYPE html>
   h3 {{ margin-top: 1.5rem; }}
   img {{ max-width: 100%; border: 1px solid #d1d5db; border-radius: 6px;
         box-shadow: 0 1px 3px rgba(0,0,0,.1); margin: .5rem 0 1rem; }}
-  ul {{ padding-left: 1.4rem; }}
+  ul, ol {{ padding-left: 1.4rem; }}
+  ul ul, ul ol, ol ol, ol ul {{ margin: .2rem 0; }}
+  code {{ background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 3px;
+         padding: .05rem .3rem; font-size: .92em;
+         font-family: Consolas, "Courier New", monospace; }}
+  table {{ border-collapse: collapse; margin: .75rem 0 1.25rem; width: 100%; }}
+  th, td {{ border: 1px solid #d1d5db; padding: .4rem .6rem; text-align: left;
+           vertical-align: top; }}
+  th {{ background: #f3f4f6; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -353,6 +460,45 @@ _HTML_SHELL = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+
+def _list_html(items: list[dict]) -> str:
+    """Nested <ul>/<ol> from the flat level-tagged items.
+
+    A sublist is emitted as a sibling of its parent <li>, not inside it; browsers
+    indent both identically.
+    """
+    parts: list[str] = []
+    open_tags: list[str] = []
+    for item in items:
+        depth = item["level"] + 1
+        tag = "ol" if item["ordered"] else "ul"
+        while len(open_tags) > depth:
+            parts.append(f"</{open_tags.pop()}>")
+        # Same depth but switched between numbered and bulleted: close and reopen.
+        if len(open_tags) == depth and open_tags[-1] != tag:
+            parts.append(f"</{open_tags.pop()}>")
+        while len(open_tags) < depth:
+            parts.append(f"<{tag}>")
+            open_tags.append(tag)
+        parts.append(f"<li>{_inline_html(item['text'])}</li>")
+    while open_tags:
+        parts.append(f"</{open_tags.pop()}>")
+    return "".join(parts)
+
+
+def _table_html(block: dict) -> str:
+    def cell(tag: str, text: str, align: str | None) -> str:
+        style = f' style="text-align:{align}"' if align else ""
+        return f"<{tag}{style}>{_inline_html(text)}</{tag}>"
+
+    aligns = block["align"]
+    head = "".join(cell("th", t, aligns[i]) for i, t in enumerate(block["header"]))
+    body = "".join(
+        "<tr>" + "".join(cell("td", t, aligns[i]) for i, t in enumerate(row)) + "</tr>"
+        for row in block["rows"]
+    )
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
 def _write_html(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
@@ -364,9 +510,10 @@ def _write_html(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
             if level == 1:
                 title = text
             parts.append(f"<h{level}>{_inline_html(text)}</h{level}>")
-        elif kind == "bullets":
-            items = "".join(f"<li>{_inline_html(i)}</li>" for i in payload)
-            parts.append(f"<ul>{items}</ul>")
+        elif kind == "list":
+            parts.append(_list_html(payload))
+        elif kind == "table":
+            parts.append(_table_html(payload))
         elif kind == "image":
             src = images[payload]
             b64 = base64.standard_b64encode(src.read_bytes()).decode("ascii")
@@ -383,17 +530,30 @@ def _write_html(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
 
 
 def _inline_html(text: str) -> str:
-    escaped = html_module.escape(text)
-    return _BOLD_RE.sub(r"<strong>\1</strong>", escaped)
+    out: list[str] = []
+    for chunk, bold, italic, code in _iter_inline(text):
+        escaped = html_module.escape(chunk)
+        if code:
+            out.append(f"<code>{escaped}</code>")
+        elif bold:
+            out.append(f"<strong>{escaped}</strong>")
+        elif italic:
+            out.append(f"<em>{escaped}</em>")
+        else:
+            out.append(escaped)
+    return "".join(out)
 
 
-# ------------------------------------------------------------------ #
-# Word (.docx)                                                         #
-# ------------------------------------------------------------------ #
+# --- Word (.docx) ---
+
+# Deepest built-in "List Bullet N" style in python-docx's default template.
+_DOCX_MAX_LIST_LEVEL = 2
+# Word's default body indent step.
+_DOCX_INDENT_STEP_IN = 0.25
+
 
 def _write_docx(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
-    # Imported here so a broken python-docx install only breaks docx export,
-    # not md/html (write_outputs skips failed formats).
+    # Imported here so a broken python-docx install only breaks docx export.
     from docx import Document
     from docx.shared import Inches
 
@@ -402,40 +562,109 @@ def _write_docx(doc: str, images: dict, output_dir: Path, stem: str) -> Path:
         if kind == "heading":
             level, text = payload
             # python-docx: level 0 = Title style; map H1→Title-ish heading 0.
-            document.add_heading(_strip_bold(text), level=max(0, level - 1))
-        elif kind == "bullets":
-            for item in payload:
-                document.add_paragraph(_strip_bold(item), style="List Bullet")
+            document.add_heading(_strip_inline(text), level=max(0, level - 1))
+        elif kind == "list":
+            _add_docx_list(document, payload)
+        elif kind == "table":
+            _add_docx_table(document, payload)
         elif kind == "image":
             document.add_picture(str(images[payload]), width=Inches(6.0))
         else:
-            _add_para_with_bold(document, payload)
+            _add_docx_runs(document.add_paragraph(), payload)
 
     path = _unique_path(output_dir / f"{stem}.docx")
     document.save(str(path))
     return path
 
 
-def _strip_bold(text: str) -> str:
-    return _BOLD_RE.sub(r"\1", text)
+def _add_docx_runs(para, text: str, force_bold: bool = False) -> None:
+    """Fill a paragraph with runs carrying bold / italic / monospace."""
+    for chunk, bold, italic, code in _iter_inline(text):
+        run = para.add_run(chunk)
+        run.bold = bold or force_bold
+        run.italic = italic
+        if code:
+            run.font.name = "Consolas"
 
 
-def _add_para_with_bold(document, text: str) -> None:
-    """Paragraph preserving **bold** spans as bold runs."""
-    para = document.add_paragraph()
-    pos = 0
-    for match in _BOLD_RE.finditer(text):
-        if match.start() > pos:
-            para.add_run(text[pos:match.start()])
-        para.add_run(match.group(1)).bold = True
-        pos = match.end()
-    if pos < len(text):
-        para.add_run(text[pos:])
+def _add_docx_list(document, items: list[dict]) -> None:
+    """Write a nested list.
+
+    Numbered items are literal text plus an indent, not Word's "List Number" style:
+    that style shares one numbering definition per document, so a later list would
+    continue counting instead of restarting at 1.
+    """
+    from docx.shared import Inches
+
+    counters: dict[int, int] = {}
+    for item in items:
+        level = min(item["level"], _DOCX_MAX_LIST_LEVEL)
+        # Drop counters below this level so the next sublist restarts at 1.
+        for deeper in [key for key in counters if key > level]:
+            del counters[deeper]
+
+        if item["ordered"]:
+            counters[level] = counters.get(level, 0) + 1
+            para = document.add_paragraph()
+            para.paragraph_format.left_indent = Inches(
+                _DOCX_INDENT_STEP_IN * (level + 1)
+            )
+            para.add_run(f"{counters[level]}. ")
+            _add_docx_runs(para, item["text"])
+        else:
+            counters.pop(level, None)
+            style = "List Bullet" if level == 0 else f"List Bullet {level + 1}"
+            try:
+                para = document.add_paragraph(style=style)
+            except KeyError:
+                # Template without the deeper styles: fake the depth with an indent.
+                para = document.add_paragraph(style="List Bullet")
+                para.paragraph_format.left_indent = Inches(
+                    _DOCX_INDENT_STEP_IN * (level + 1)
+                )
+            _add_docx_runs(para, item["text"])
 
 
-# ------------------------------------------------------------------ #
-# Filename helpers (moved from output_writer, semantics unchanged)      #
-# ------------------------------------------------------------------ #
+def _add_docx_table(document, block: dict) -> None:
+    """Write a pipe table as a real Word table with a bold header row."""
+    header = block["header"]
+    table = document.add_table(rows=1, cols=len(header))
+    try:
+        # Without a border style a Word table has no visible gridlines.
+        table.style = "Table Grid"
+    except KeyError:
+        pass
+    table.autofit = True
+
+    for index, text in enumerate(header):
+        cell_para = table.rows[0].cells[index].paragraphs[0]
+        _add_docx_runs(cell_para, text, force_bold=True)
+        _align_docx_para(cell_para, block["align"][index])
+
+    for row in block["rows"]:
+        cells = table.add_row().cells
+        for index, text in enumerate(row):
+            cell_para = cells[index].paragraphs[0]
+            _add_docx_runs(cell_para, text)
+            _align_docx_para(cell_para, block["align"][index])
+
+
+def _align_docx_para(para, align: str | None) -> None:
+    """Apply a markdown column alignment. Silent no-op if unavailable."""
+    if not align or align == "left":
+        return
+    try:
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        para.alignment = {
+            "center": WD_ALIGN_PARAGRAPH.CENTER,
+            "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        }[align]
+    except (ImportError, KeyError):
+        pass
+
+
+# --- Filename helpers ---
 
 def _safe_dirname(name: str) -> str:
     """Session name → filesystem-safe output folder name."""
@@ -453,20 +682,13 @@ def _iter_h1_titles(markdown: str):
 
 
 def _derive_title(markdown: str) -> str:
-    """
-    The document's first H1 exactly as the model wrote it, or "" if there is none.
-
-    Kept separate from _derive_stem because a filename stem is not a title:
-    "Reset a Locked Account" becomes "Reset_a_Locked_Account" as a stem, which is
-    correct on disk and wrong as a page heading anywhere else.
-    """
+    """The document's first H1 exactly as the model wrote it, or "" if there is none."""
     return next((t for t in _iter_h1_titles(markdown) if t), "")
 
 
 def _derive_stem(markdown: str, fallback: str) -> str:
     """Extract the H1 heading and convert it to a safe filename stem."""
-    # Keeps the original semantics: an H1 that sanitizes to nothing (e.g. one
-    # made entirely of punctuation) falls through to the next H1, not to fallback.
+    # An H1 that sanitizes to nothing falls through to the next H1, not to fallback.
     for title in _iter_h1_titles(markdown):
         safe = re.sub(r"[^\w\s-]", "", title)
         safe = re.sub(r"[\s]+", "_", safe.strip())

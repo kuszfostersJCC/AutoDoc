@@ -1,27 +1,9 @@
-"""
-recorder/session.py — Session lifecycle manager.
-
-A Session coordinates audio capture, mouse hooks, and screenshot capture for
-one recording. It maintains a timestamped event log (session.json) and writes
-it atomically after every screenshot so that a crash doesn't lose the session.
-
-Status transitions:
-    "recording"         — actively capturing (set on start())
-    "transcribed"       — Whisper has run, segments merged (set on add_transcript_segments())
-    "ready"             — fully finalised, stopped_at written (set on finalize())
-    "transcript_failed" — finalised but transcription failed/timed out
-                          (finalize(transcript_ok=False)); recoverable via the
-                          Retranscribe button in the Sessions window. Before
-                          2026-07-08 the failure path skipped finalize()
-                          entirely, leaving sessions stuck at "recording"
-                          forever with no retry — never regress that.
-
-Race-condition note: Session owns self._status. Every flush uses that field
-rather than a hardcoded string, so a late-finishing screenshot thread can never
-overwrite a "ready" status back to "recording".
+"""Session lifecycle: audio, mouse hooks and screenshots for one recording, plus
+the session.json event log (rewritten atomically after every screenshot).
 """
 
 import json
+import logging
 import shutil
 import threading
 import time
@@ -36,65 +18,44 @@ from recorder.mouse_hooks import MouseHooks
 from recorder.screenshot import capture_raw, save_screenshot_raw
 from recorder.ui_inspect import get_click_target
 
+log = logging.getLogger(__name__)
+
 
 class Session:
     def __init__(self, config: AutoDocConfig) -> None:
         self.config = config
 
-        # Identity / timing
         self._start_mono: Optional[float] = None
         self._start_time: Optional[datetime] = None
         self._stopped_at: Optional[datetime] = None
         self._session_id: Optional[str] = None
         self._session_dir: Optional[Path] = None
 
-        # Human-readable name (set by user after stopping)
         self._name: Optional[str] = None
 
-        # Recording mode: "full" (auto-captures a screenshot on every click)
-        # or "transcript_only" (clicks aren't auto-captured). This is the
-        # ONLY thing the mode controls — manual (hotkey) capture and
-        # imported photos work in both, and a "transcript_only" session is
-        # not a guarantee of zero screenshots. See start()'s comment and
-        # import_screenshots() below.
+        # "full" auto-captures a screenshot on every click; "transcript_only" does
+        # not. Neither is a guarantee about how many screenshots a session has.
         self._mode: str = "full"
 
-        # Event log
         self._events: list = []
         self._screenshot_count = 0
 
-        # Status — single source of truth for session.json
         self._status = "idle"
 
-        # Sub-components
         self._audio = AudioCapture()
         self._hooks: Optional[MouseHooks] = None
 
-        # Threading
         self._lock = threading.Lock()
         self._running = False
 
-        # Pause bookkeeping (PRD F4). INVARIANT: audio drops frames while
-        # paused and event offsets subtract cumulative paused time, so both
-        # timelines exclude pauses and Whisper timestamps stay aligned with
-        # screenshot offsets. Any change here must preserve that.
         self._paused = False
         self._pause_started: Optional[float] = None
         self._paused_total = 0.0
 
-        # Resume bookkeeping (PRD F5). When re-recording into an existing
-        # session, new-event offsets start at the exact duration of the
-        # pre-existing audio (frames/rate — no wall-clock drift), and the new
-        # audio chunk is concatenated onto audio_full.wav on stop().
+        # Resume: new-event offsets start at the duration of the pre-existing audio.
         self._resumed = False
         self._offset_base_ms = 0
-        # Top-level session.json keys we don't own (e.g. screenshot_render_mode)
-        # — preserved across flushes so a resume doesn't erase editor choices.
         self._extra_keys: dict = {}
-
-    # ------------------------------------------------------------------ #
-    # Public read-only properties                                          #
-    # ------------------------------------------------------------------ #
 
     @property
     def session_id(self) -> Optional[str]:
@@ -112,20 +73,11 @@ class Session:
     def name(self) -> Optional[str]:
         return self._name
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle                                                            #
-    # ------------------------------------------------------------------ #
+    # ---- Lifecycle ----
 
     def start(self, mode: str = "full", resume_dir: Optional[Path] = None) -> Path:
-        """
-        Begin audio + mouse capture.
-
-        Fresh session (resume_dir=None): creates a new session folder.
-        Resume (PRD F5): re-opens the existing session at resume_dir —
-        screenshots and their edits are kept, old transcript segments are
-        dropped (the full concatenated audio is retranscribed on stop), and
-        new-event offsets continue exactly where the existing audio ends.
-        """
+        """Begin audio + mouse capture in a new session folder, or in resume_dir:
+        screenshots kept, old segments dropped, offsets continuing at the audio end."""
         self._start_mono = time.monotonic()
 
         if resume_dir is not None:
@@ -147,24 +99,24 @@ class Session:
 
         self._flush_json()
 
-        # Resumed sessions record the new chunk separately; stop() splices it
-        # onto audio_full.wav (the wave module cannot append in place).
+        # Resumed runs record separately; stop() splices (wave can't append in place).
         wav_name = "audio_new.wav" if self._resumed else "audio_full.wav"
         try:
-            self._audio.start(self._session_dir / wav_name)
+            self._audio.start(
+                self._session_dir / wav_name,
+                device_name=getattr(self.config, "audio_device", "") or "",
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"Could not open microphone for recording.\n"
                 f"Check that a microphone is connected and that Windows has "
                 f"permission to access it (Settings → Privacy → Microphone).\n"
+                f"If you picked a specific device in AutoDoc's Settings → "
+                f"Microphone, try System default instead.\n"
                 f"Detail: {exc}"
             ) from exc
 
-        # The ONE place self._mode legitimately gates behavior: whether clicks
-        # are auto-captured. Everything else (UI panels, export templates,
-        # generation) should branch on whether the session actually HAS
-        # screenshot events, never on this mode string — see
-        # recorder/session.py::import_screenshots() and HANDOFF.md.
+        # The one place _mode gates behaviour; elsewhere test for screenshot events.
         if mode == "full":
             self._hooks = MouseHooks(
                 on_left_click=lambda x, y: self._handle_click(x, y, "left"),
@@ -201,10 +153,8 @@ class Session:
         started = data.get("started_at")
         self._start_time = datetime.fromisoformat(started) if started else datetime.now(timezone.utc)
 
-        # Old transcript segments are invalid the moment new audio exists —
-        # the whole concatenated file is retranscribed on stop. A stale
-        # edited_full_transcript would silently win at generation time, so it
-        # is dropped too (the Record More dialog warns about this).
+        # New audio invalidates old segments and any edited_full_transcript, which
+        # _OWNED_KEYS drops; the whole concatenated file is retranscribed on stop.
         self._events = [
             e for e in data.get("events", []) if e.get("type") != "transcript_segment"
         ]
@@ -219,8 +169,7 @@ class Session:
         (self._session_dir / "screenshots").mkdir(exist_ok=True)
 
     def _splice_resumed_audio(self) -> None:
-        """Concatenate audio_new.wav onto audio_full.wav (same format by
-        construction: 16 kHz mono int16). Runs after capture stops."""
+        """Concatenate audio_new.wav onto audio_full.wav (16 kHz mono int16 both)."""
         full_path = self._session_dir / "audio_full.wav"
         new_path = self._session_dir / "audio_new.wav"
         if not new_path.exists():
@@ -240,7 +189,7 @@ class Session:
         new_path.unlink(missing_ok=True)
 
     def stop(self) -> Path:
-        """Stop capture. Returns session directory for the caller to use."""
+        """Stop capture; returns the session directory."""
         if self._paused:
             self.resume()  # close out pause bookkeeping before stopping
         self._running = False
@@ -252,9 +201,7 @@ class Session:
             self._splice_resumed_audio()
         return self._session_dir
 
-    # ------------------------------------------------------------------ #
-    # Pause / resume / manual capture (PRD F4)                             #
-    # ------------------------------------------------------------------ #
+    # ---- Pause / resume / manual capture ----
 
     @property
     def is_paused(self) -> bool:
@@ -269,7 +216,6 @@ class Session:
         self._audio.set_paused(True)
 
     def resume(self) -> None:
-        """Resume capture; paused span excluded from both timelines."""
         if not self._paused:
             return
         if self._pause_started is not None:
@@ -279,16 +225,8 @@ class Session:
         self._audio.set_paused(False)
 
     def manual_capture(self) -> None:
-        """
-        Hotkey-triggered screenshot at the current cursor position, without a
-        click (result screens, open menus). click_type "manual" flows through
-        the normal pipeline; content.py describes it as a manual capture.
-
-        Deliberately NOT gated on self._mode: auto-capture-on-click and
-        manual (hotkey) capture are independent concerns. "transcript_only"
-        only ever meant "don't auto-capture clicks" — it never meant "no
-        screenshots are possible," so the hotkey works in either mode.
-        """
+        """Hotkey screenshot at the cursor with no click behind it (result screens,
+        open menus). Not gated on _mode, which only governs auto-capture."""
         if not self._running or self._paused:
             return
         from pynput.mouse import Controller
@@ -297,9 +235,9 @@ class Session:
         self._handle_click(int(x), int(y), "manual")
 
     def _now_offset_ms(self) -> int:
-        """Event offset: wall time since capture start MINUS cumulative paused
-        time, PLUS the resumed-session base (duration of pre-existing audio).
-        Aligns with the concatenated WAV by construction."""
+        """Event offset: elapsed time minus paused time, plus the resumed-session
+        base. Audio also drops frames while paused, so both timelines exclude
+        pauses — break either and Whisper timestamps stop matching screenshots."""
         paused = self._paused_total
         if self._paused and self._pause_started is not None:
             paused += time.monotonic() - self._pause_started
@@ -308,19 +246,15 @@ class Session:
         )
 
     def set_name(self, name: str) -> None:
-        """Set a human-readable name for this session and persist it immediately."""
+        """Set the session name and persist it immediately."""
         with self._lock:
             self._name = name.strip() or None
             if self._session_dir:
                 self._flush_json()
 
     def add_transcript_segments(self, segments: list) -> None:
-        """
-        Install Whisper transcript segments into the event log, REPLACING any
-        existing ones. Replacement (not append) matters for resumed sessions,
-        where the whole concatenated audio is retranscribed; for fresh
-        sessions there is nothing to replace and this is a plain extend.
-        """
+        """Install Whisper segments, REPLACING any existing ones — a resumed session
+        retranscribes its whole concatenated audio."""
         with self._lock:
             self._events = [
                 e for e in self._events if e.get("type") != "transcript_segment"
@@ -330,71 +264,77 @@ class Session:
             self._flush_json()
 
     def finalize(self, stopped_at: datetime, transcript_ok: bool = True) -> None:
-        """
-        Record the stop time and write the final JSON.
-
-        transcript_ok=False marks the session "transcript_failed" instead of
-        "ready" — the session (audio, screenshots) is fully saved and the
-        Sessions window offers Retranscribe. ALWAYS call finalize, even when
-        transcription fails: skipping it leaves status stuck at "recording".
-        """
+        """Record the stop time and write the final JSON. Call it even when
+        transcription failed (transcript_ok=False), or status stays "recording"."""
         with self._lock:
             self._stopped_at = stopped_at
             self._status = "ready" if transcript_ok else "transcript_failed"
             self._flush_json()
 
-    # ------------------------------------------------------------------ #
-    # Click → screenshot pipeline                                          #
-    # ------------------------------------------------------------------ #
+    # ---- Click to screenshot pipeline ----
 
     def _handle_click(self, x: int, y: int, click_type: str) -> None:
+        """Grab the screen NOW, on the caller's thread; save and inspect later.
+
+        The grab is the one step that cannot be deferred — the click fires on
+        button-down and the target window starts repainting immediately, so a
+        grab handed to a worker thread races the very change it is meant to
+        precede. That race is what produced blank mid-load pages. Downscaling,
+        writing the PNG and the UI Automation lookup all tolerate the delay.
+        """
         if not self._running or self._paused:
             return
+        if self._screenshot_count >= self.config.max_screenshots_per_session:
+            return
 
+        offset_ms = self._now_offset_ms()
+        try:
+            img, img_x, img_y = capture_raw(x, y)
+        except Exception:
+            log.exception("screenshot: capture failed at (%d, %d)", x, y)
+            return
+
+        # Numbered only after a successful grab, so a failed capture doesn't
+        # consume an event id or a slot against max_screenshots_per_session.
         with self._lock:
             if self._screenshot_count >= self.config.max_screenshots_per_session:
                 return
             self._screenshot_count += 1
             count = self._screenshot_count
 
-        offset_ms = self._now_offset_ms()
         filename = f"screenshots/{count:04d}_{offset_ms}.png"
-        dest_path = self._session_dir / filename
-
         threading.Thread(
-            target=self._capture_and_save,
-            args=(x, y, click_type, offset_ms, count, filename, dest_path),
+            target=self._save_capture,
+            args=(img, img_x, img_y, x, y, click_type, offset_ms, count, filename),
             daemon=True,
         ).start()
 
-    def _capture_and_save(
+    def _save_capture(
         self,
+        img,
+        img_x: int,
+        img_y: int,
         x: int,
         y: int,
         click_type: str,
         offset_ms: int,
         count: int,
         filename: str,
-        dest_path: Path,
     ) -> None:
-        # Identify the clicked element FIRST — the UI may react to the click
-        # (menus close, dialogs open), so every millisecond between click and
-        # inspection loses fidelity. Best-effort: None is fine (PRD F1).
         ui_element = None
         try:
             ui_element = get_click_target(x, y)
         except Exception:
-            pass  # ui_inspect already logs; a click must never fail over this.
+            pass  # Best-effort; a click must never fail over this.
 
         try:
-            # Stored RAW — blur/circle effects are applied at render time
-            # (editor/export/generation) so they stay editable per-session.
-            # See recorder/screenshot.py module docstring.
-            img, img_x, img_y = capture_raw(x, y)
+            # Stored raw; blur/circle effects are applied at render time.
             click_img_x, click_img_y = save_screenshot_raw(
-                img, img_x, img_y, dest_path, self.config.max_image_dimension
+                img, img_x, img_y, self._session_dir / filename,
+                self.config.max_image_dimension,
             )
         except Exception:
+            log.exception("screenshot: could not write %s", filename)
             return
 
         event = {
@@ -406,34 +346,27 @@ class Session:
                 "click_type": click_type,
                 "click_x": x,
                 "click_y": y,
-                # Click position in the SAVED image's pixel space (post-
-                # downscale) — required to re-render blur/circle effects.
-                # Absence of these keys marks a legacy pre-raw-storage event.
+                # In the SAVED image's pixel space; absence marks a legacy event.
                 "click_img_x": click_img_x,
                 "click_img_y": click_img_y,
             },
             "edited_text": None,
         }
         if ui_element:
-            # Ground truth for the generator: what was actually clicked
-            # (accessible name/role) and where (window title, app).
             event["data"]["ui_element"] = ui_element
 
         with self._lock:
             self._events.append(event)
-            # self._status is always used — no hardcoded "recording" here,
-            # so a late thread can't overwrite a "ready" status.
+            # _flush_json writes self._status, so this late thread cannot put a
+            # finished session back to "recording".
             self._flush_json()
 
-    # ------------------------------------------------------------------ #
-    # JSON persistence                                                     #
-    # ------------------------------------------------------------------ #
+    # ---- JSON persistence ----
 
     def _flush_json(self) -> None:
         """Serialize current state to session.json atomically. Caller holds lock."""
         data = {
-            # Keys we don't own (editor's screenshot_render_mode etc.) first,
-            # so our owned keys below always win on collision.
+            # Keys we don't own first, so the owned keys below win on collision.
             **self._extra_keys,
             "schema": "autodoc-session/v1",
             "session_id": self._session_id,
@@ -451,47 +384,13 @@ class Session:
         tmp.replace(path)
 
 
-# ---------------------------------------------------------------------- #
-# Post-hoc screenshot import (append to an already-saved session)          #
-# ---------------------------------------------------------------------- #
+# ---- Post-hoc screenshot import ----
 
 def import_screenshots(session_dir: Path, session_data: dict, image_paths: list) -> dict:
-    """
-    Append externally-sourced images (e.g. phone photos of a BIOS screen that
-    AutoDoc physically cannot screenshot) to an already-saved session as
-    screenshot events. This is a free function, not a Session method: it
-    operates on a session.json dict + folder on disk, not a live recording,
-    the same way the Sessions window's Retranscribe already does.
-
-    These events deliberately have NO click_x/click_y/click_img_x/click_img_y
-    — there is no real click behind a photograph. Missing click_img_x/
-    click_img_y is exactly what recorder/screenshot.py::event_is_legacy()
-    checks for, so these render as plain raw images (no blur/circle math
-    attempted — there's no click point to center it on) while still
-    supporting manual redaction, which only depends on data.redact_regions.
-    click_type="imported" is a new value content.py's _describe_click() and
-    the session editor's thumbnail label special-case, so the model isn't
-    told a fictional click happened.
-
-    Placement: each image is appended 1 second after the previous highest
-    timestamp_offset_ms in the session, so imported photos always sort after
-    every existing event. This is deliberately coarse. If the session has an
-    edited_full_transcript, content.py places ALL screenshots after the full
-    narration block in chronological order regardless of exact spacing — so
-    only the relative order among imported photos matters, not alignment
-    with a specific narration segment. That's the intended pairing: import
-    photos, then review/finalize the transcript as one block in the editor.
-
-    Args:
-        session_dir:   The session's folder (screenshots/ created if absent).
-        session_data:  Parsed session.json dict — events are appended in
-                       place and the same dict is returned for convenience.
-        image_paths:   Source image file paths (any format Pillow can open —
-                       does not need to be PNG).
-
-    Returns:
-        The same session_data dict, mutated. Caller is responsible for
-        persisting it (e.g. the session editor's existing Save Changes path).
+    """Append external images (any format Pillow opens) to a saved session as
+    screenshot events, one second apart after the last existing offset. They carry
+    no click coordinates, so event_is_legacy() sees them and they render raw.
+    Mutates and returns session_data; the caller persists it.
     """
     events = session_data.setdefault("events", [])
 

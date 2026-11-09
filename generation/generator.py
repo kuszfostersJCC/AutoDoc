@@ -1,13 +1,4 @@
-"""
-generation/generator.py — Single, backend-agnostic entry point for documentation
-generation. This is the only function the UI layer (sessions_window, session_editor)
-should call.
-
-Backend-agnostic still means something after the 2026-08-06 removal of the
-Anthropic path, even though there is only one backend left: nothing here or in
-generation/content.py knows a wire format, an endpoint or a credential. That
-separation is what kept the removal a two-file change.
-"""
+"""Backend-agnostic entry point for documentation generation; the UI calls only this."""
 
 from pathlib import Path
 
@@ -21,21 +12,13 @@ def generate_documentation(
     session_data: dict,
     session_dir: Path,
 ) -> str:
-    """
-    Generate markdown documentation for a session using the configured AI server.
+    """Generate markdown documentation for a session using the configured AI server.
 
-    Args:
-        config:       Loaded AutoDocConfig (holds the endpoint, model and key).
-        session_data: Full parsed session.json dict (may contain edited_full_transcript).
-        session_dir:  Path to the session folder (for resolving image filenames).
-
-    Raises:
-        ValueError: If there are no usable events (empty session).
-        generation.backends.base.DocGenerationError: On backend-level failures
-            (bad credentials, unreachable server, malformed response, etc.).
+    Raises ValueError on an empty session, DocGenerationError on backend failures.
     """
     content_blocks = build_content_blocks(session_data, session_dir, config)
-    if not content_blocks:
+    # build_content_blocks() always emits a preamble block, so one block means empty.
+    if len(content_blocks) <= 1:
         raise ValueError(
             "No usable content found in this session.\n"
             "The session may have no transcript and no screenshots."

@@ -1,28 +1,7 @@
-"""
-recorder/ui_inspect.py — Identify the UI element under a screen point.
+"""Identify the UI element under a screen point; Windows only, best effort.
 
-WHY (PRD F1): events used to store only pixel coordinates, leaving the vision
-model to guess what was clicked — the least reliable link in the pipeline,
-especially with local models. Capturing the clicked element's accessible name
-at click time gives the generator deterministic ground truth ("Click 'Submit
-Grade Change'"), the same way Scribe/Tango/FlowShare/Folge do it.
-
-Two independent layers, each degrading gracefully:
-
-  1. Pure-ctypes Win32 (no dependencies, effectively cannot be absent):
-     window title of the top-level window under the point, plus the owning
-     process's executable name.
-  2. UI Automation via comtypes (optional dependency): the specific element's
-     accessible Name and ControlType. Any failure — comtypes missing, COM
-     error, UIA timeout on a stubborn app — silently degrades to layer 1.
-
-Threading: get_click_target() is called from the per-click capture worker
-thread (see recorder/session.py). COM must be initialized per thread, so the
-UIA layer calls CoInitialize itself and never assumes prior state.
-
-Failures are logged at DEBUG (first occurrence per failure site at WARNING)
-and never surfaced to the user: a missing element name only means slightly
-weaker step text.
+Two independent layers: pure-ctypes Win32 (window title, process name) and
+optional comtypes UIA (element name, role). Either may fail and degrade quietly.
 """
 
 import logging
@@ -52,13 +31,8 @@ _win32_warned = False
 
 
 def get_click_target(x: int, y: int) -> Optional[dict]:
-    """
-    Best-effort identification of the UI element at screen point (x, y).
-
-    Returns a dict with keys element_name, element_role, window_title,
-    app_name (each possibly ""), or None when nothing at all could be
-    determined (non-Windows, or every layer failed).
-    """
+    """A dict of element_name, element_role, window_title and app_name (each
+    possibly ""), or None when nothing at all could be determined."""
     if not _IS_WINDOWS:
         return None
 
@@ -75,10 +49,6 @@ def get_click_target(x: int, y: int) -> Optional[dict]:
     return info if any(info.values()) else None
 
 
-# ------------------------------------------------------------------ #
-# Layer 1: pure-ctypes Win32 — window title + process name             #
-# ------------------------------------------------------------------ #
-
 def _win32_window_info(x: int, y: int) -> Optional[dict]:
     global _win32_warned
     try:
@@ -94,7 +64,6 @@ def _win32_window_info(x: int, y: int) -> Optional[dict]:
         GA_ROOT = 2
         top = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
 
-        # Window title
         length = user32.GetWindowTextLengthW(top)
         title = ""
         if length > 0:
@@ -102,7 +71,6 @@ def _win32_window_info(x: int, y: int) -> Optional[dict]:
             user32.GetWindowTextW(top, buf, length + 1)
             title = buf.value
 
-        # Owning process executable name
         app_name = ""
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(top, ctypes.byref(pid))
@@ -128,10 +96,6 @@ def _win32_window_info(x: int, y: int) -> Optional[dict]:
         return None
 
 
-# ------------------------------------------------------------------ #
-# Layer 2: UI Automation via comtypes — element name + role            #
-# ------------------------------------------------------------------ #
-
 def _uia_element_info(x: int, y: int) -> Optional[dict]:
     global _uia_warned
     try:
@@ -140,8 +104,7 @@ def _uia_element_info(x: int, y: int) -> Optional[dict]:
         import comtypes
         import comtypes.client
 
-        # This worker thread has no COM state yet — initialize (idempotent
-        # per thread; RPC_E_CHANGED_MODE would raise and be swallowed below).
+        # Per-thread COM init: the capture worker thread has no COM state yet.
         try:
             comtypes.CoInitialize()
         except OSError:

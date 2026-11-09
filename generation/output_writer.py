@@ -1,14 +1,6 @@
-"""
-generation/output_writer.py — Write the generated markdown to the output folder.
+"""Writes plain markdown, screenshot tokens left as-is.
 
-DEPRECATED since v1.1 (PRD F2): generation/renderers.py is the output path
-now — it writes md/html/docx with screenshots embedded. This module is kept
-only so any straggler callers keep working; it writes plain markdown with
-screenshot tokens left as-is. Do not add features here.
-
-The output filename is derived from the document's H1 heading so the file is
-human-readable (e.g., "How_to_Submit_a_Grade_Change.md"). If the title can't
-be parsed, the session ID is used as a fallback.
+Deprecated; generation/renderers.py is the current output path.
 """
 
 import re
@@ -16,11 +8,7 @@ from pathlib import Path
 
 
 def write_output(markdown: str, session_id: str, output_dir: Path) -> Path:
-    """
-    Save the markdown string to output_dir and return the final file path.
-
-    Handles duplicate filenames by appending a counter suffix.
-    """
+    """Save the markdown to output_dir and return the final path."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stem = _derive_stem(markdown, session_id)
@@ -29,20 +17,15 @@ def write_output(markdown: str, session_id: str, output_dir: Path) -> Path:
     return output_path
 
 
-# ------------------------------------------------------------------ #
-# Helpers                                                              #
-# ------------------------------------------------------------------ #
-
 def _derive_stem(markdown: str, fallback: str) -> str:
     """Extract the H1 heading and convert it to a safe filename stem."""
     for line in markdown.splitlines():
         stripped = line.strip()
         if stripped.startswith("# "):
             title = stripped[2:].strip()
-            # Keep alphanumeric, spaces, hyphens, underscores; collapse to underscores.
             safe = re.sub(r"[^\w\s-]", "", title)
             safe = re.sub(r"[\s]+", "_", safe.strip())
-            safe = safe[:80]  # reasonable filename length cap
+            safe = safe[:80]
             if safe:
                 return safe
     return fallback
